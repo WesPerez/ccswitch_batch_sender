@@ -109,6 +109,8 @@ class ConfigTests(unittest.TestCase):
         config = sender.normalize_config()
         self.assertEqual(config["transport_mode"], sender.TRANSPORT_CODEX_CLI)
         self.assertEqual(config["cli_concurrency"], 4)
+        self.assertEqual(config["request_count"], 5)
+        self.assertEqual(config["retry_count"], 5)
         self.assertTrue(config["random_probe_enabled"])
         self.assertGreaterEqual(config["max_output_tokens"], 32)
 
@@ -122,6 +124,16 @@ class ConfigTests(unittest.TestCase):
         migrated = sender.migrate_saved_config({"custom_body_enabled": True}, 2)
         self.assertEqual(migrated["transport_mode"], sender.TRANSPORT_DIRECT)
         self.assertEqual(migrated["cli_concurrency"], 4)
+
+    def test_v3_saved_defaults_migrate_to_new_batch_defaults(self) -> None:
+        migrated = sender.migrate_saved_config({"request_count": 20, "retry_count": 0}, 3)
+        self.assertEqual(migrated["request_count"], 5)
+        self.assertEqual(migrated["retry_count"], 5)
+
+    def test_v3_custom_batch_values_are_preserved(self) -> None:
+        migrated = sender.migrate_saved_config({"request_count": 8, "retry_count": 2}, 3)
+        self.assertEqual(migrated["request_count"], 8)
+        self.assertEqual(migrated["retry_count"], 2)
 
     def test_custom_body_can_replace_the_prompt(self) -> None:
         config = sender.normalize_config(

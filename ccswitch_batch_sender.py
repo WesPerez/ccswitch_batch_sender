@@ -27,13 +27,13 @@ from typing import Any, Callable, Iterable
 
 APP_NAME = "CC Switch Batch Sender"
 APP_TITLE = "CC Switch 批量请求"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".cc-switch" / "cc-switch.db"
 REGISTRY_PATH = r"Software\CCSwitchBatchSender"
 REGISTRY_VALUE = "SettingsJson"
 REGISTRY_SCHEMA_VALUE = "SchemaVersion"
-REGISTRY_SCHEMA_VERSION = 3
+REGISTRY_SCHEMA_VERSION = 4
 MUTEX_NAME = r"Local\CCSwitchBatchSender.App"
 PROMPT_CACHE_KEY_PLACEHOLDER = "<每个请求唯一>"
 RANDOM_TASK_PLACEHOLDER = "<每个请求随机任务>"
@@ -54,8 +54,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "base_url": "",
     "message": DEFAULT_FIXED_MESSAGE,
     "random_probe_enabled": True,
-    "request_count": 20,
-    "retry_count": 0,
+    "request_count": 5,
+    "retry_count": 5,
     "max_output_tokens": 64,
     "request_timeout_seconds": 7200,
     "max_wait_seconds": 7200,
@@ -443,6 +443,11 @@ def migrate_saved_config(values: dict[str, Any], schema_version: int) -> dict[st
             TRANSPORT_DIRECT if bool(migrated.get("custom_body_enabled")) else TRANSPORT_CODEX_CLI,
         )
         migrated.setdefault("cli_concurrency", DEFAULT_CONFIG["cli_concurrency"])
+    if schema_version < 4:
+        if migrated.get("request_count") in {None, 20, "20"}:
+            migrated["request_count"] = DEFAULT_CONFIG["request_count"]
+        if migrated.get("retry_count") in {None, 0, "0"}:
+            migrated["retry_count"] = DEFAULT_CONFIG["retry_count"]
     return migrated
 
 

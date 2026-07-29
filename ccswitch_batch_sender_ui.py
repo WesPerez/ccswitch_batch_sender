@@ -517,7 +517,7 @@ class BatchSenderApp:
         action_bar.grid_columnconfigure(3, weight=1)
         self.start_button = self._button(
             action_bar,
-            "发送 20 个",
+            f"运行 {DEFAULT_CONFIG['request_count']} 个任务",
             "send",
             self.start_run,
             "Primary.TButton",
