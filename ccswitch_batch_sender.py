@@ -27,13 +27,13 @@ from typing import Any, Callable, Iterable
 
 APP_NAME = "CC Switch Batch Sender"
 APP_TITLE = "CC Switch 批量请求"
-APP_VERSION = "2.2.1"
+APP_VERSION = "2.2.2"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".cc-switch" / "cc-switch.db"
 REGISTRY_PATH = r"Software\CCSwitchBatchSender"
 REGISTRY_VALUE = "SettingsJson"
 REGISTRY_SCHEMA_VALUE = "SchemaVersion"
-REGISTRY_SCHEMA_VERSION = 4
+REGISTRY_SCHEMA_VERSION = 5
 MUTEX_NAME = r"Local\CCSwitchBatchSender.App"
 PROMPT_CACHE_KEY_PLACEHOLDER = "<每个请求唯一>"
 RANDOM_TASK_PLACEHOLDER = "<每个请求随机任务>"
@@ -48,14 +48,14 @@ TRANSPORT_DIRECT = "direct"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "transport_mode": TRANSPORT_CODEX_CLI,
-    "cli_concurrency": 4,
+    "cli_concurrency": 10,
     "provider_id": "current",
     "model": "",
     "base_url": "",
     "message": DEFAULT_FIXED_MESSAGE,
     "random_probe_enabled": True,
-    "request_count": 5,
-    "retry_count": 5,
+    "request_count": 10,
+    "retry_count": 2,
     "max_output_tokens": 64,
     "request_timeout_seconds": 7200,
     "max_wait_seconds": 7200,
@@ -154,6 +154,7 @@ class AttemptResult:
     provider_name: str = ""
     request_prompt: str = ""
     pending: bool = False
+    cancelled: bool = False
     response_headers: dict[str, str] = field(default_factory=dict)
 
 
@@ -261,8 +262,19 @@ class ActiveCodexProcessRegistry:
     def terminate_all(self) -> None:
         with self._lock:
             processes = list(self._processes.values())
-        for process in processes:
-            _terminate_process_tree(process)
+        terminators = [
+            threading.Thread(
+                target=_terminate_process_tree,
+                args=(process,),
+                name=f"ccswitch-terminate-{process.pid}",
+                daemon=True,
+            )
+            for process in processes
+        ]
+        for thread in terminators:
+            thread.start()
+        for thread in terminators:
+            thread.join()
         with self._lock:
             for process in processes:
                 if process.poll() is not None:
@@ -383,8 +395,8 @@ def normalize_config(values: dict[str, Any] | None = None) -> dict[str, Any]:
         raise SenderError("请求次数必须在 1 到 100 之间。")
     if config["transport_mode"] not in {TRANSPORT_CODEX_CLI, TRANSPORT_DIRECT}:
         raise SenderError("请求来源只能是官方 Codex CLI 或直接 API。")
-    if not 1 <= config["cli_concurrency"] <= 8:
-        raise SenderError("CLI 并发数必须在 1 到 8 之间。")
+    if not 1 <= config["cli_concurrency"] <= 10:
+        raise SenderError("CLI 并发数必须在 1 到 10 之间。")
     if not 0 <= config["retry_count"] <= 10:
         raise SenderError("重试次数必须在 0 到 10 之间。")
     if not 1 <= config["max_output_tokens"] <= 4096:
@@ -448,6 +460,13 @@ def migrate_saved_config(values: dict[str, Any], schema_version: int) -> dict[st
             migrated["request_count"] = DEFAULT_CONFIG["request_count"]
         if migrated.get("retry_count") in {None, 0, "0"}:
             migrated["retry_count"] = DEFAULT_CONFIG["retry_count"]
+    if schema_version < 5:
+        if migrated.get("request_count") in {None, 5, "5"}:
+            migrated["request_count"] = DEFAULT_CONFIG["request_count"]
+        if migrated.get("retry_count") in {None, 5, "5"}:
+            migrated["retry_count"] = DEFAULT_CONFIG["retry_count"]
+        if migrated.get("cli_concurrency") in {None, 4, "4"}:
+            migrated["cli_concurrency"] = DEFAULT_CONFIG["cli_concurrency"]
     return migrated
 
 
@@ -1034,13 +1053,15 @@ def send_one_codex_cli(
                 acquired = True
                 break
         if not acquired:
+            cancelled = bool(abort_polling and abort_polling.is_set())
             return AttemptResult(
                 index=index,
                 round_no=round_no,
                 ok=False,
-                error="Codex CLI 任务在等待并发槽位时已停止或超时。",
+                error="Codex CLI 任务已被取消。" if cancelled else "Codex CLI 任务在等待并发槽位时超时。",
                 provider_name=provider.name,
                 request_prompt=request_prompt,
+                cancelled=cancelled,
             )
 
     last_error = ""
@@ -1049,6 +1070,16 @@ def send_one_codex_cli(
     last_payload: Any = None
     try:
         for base_url, endpoint in _codex_cli_endpoint_candidates(provider, str(config["endpoint_style"])):
+            if abort_polling and abort_polling.is_set():
+                return AttemptResult(
+                    index=index,
+                    round_no=round_no,
+                    ok=False,
+                    error="Codex CLI 任务已被取消。",
+                    provider_name=provider.name,
+                    request_prompt=request_prompt,
+                    cancelled=True,
+                )
             last_endpoint = endpoint
             env = os.environ.copy()
             env.pop("OPENAI_API_KEY", None)
@@ -1063,17 +1094,19 @@ def send_one_codex_cli(
             last_status = _http_status_from_text(event_error + "\n" + stderr)
             latency_ms = int((time.monotonic() - started) * 1000)
             if stopped:
+                cancelled = bool(abort_polling and abort_polling.is_set())
                 return AttemptResult(
                     index=index,
                     round_no=round_no,
                     ok=False,
                     status=last_status,
-                    error="Codex CLI 任务已停止或超时。",
+                    error="Codex CLI 任务已被取消。" if cancelled else "Codex CLI 任务已超时。",
                     endpoint=endpoint,
                     latency_ms=latency_ms,
                     payload=payload,
                     provider_name=provider.name,
                     request_prompt=request_prompt,
+                    cancelled=cancelled,
                 )
             if return_code == 0 and response_text:
                 if probe is not None:
@@ -1559,8 +1592,9 @@ def _poll_pending(
                 provider_name=provider.name,
                 request_prompt=result.request_prompt,
             )
-    reason = "轮询已停止。" if abort_event and abort_event.is_set() else "轮询超时。"
-    return AttemptResult(**{**result.__dict__, "ok": False, "error": reason})
+    cancelled = bool(abort_event and abort_event.is_set())
+    reason = "轮询已取消。" if cancelled else "轮询超时。"
+    return AttemptResult(**{**result.__dict__, "ok": False, "error": reason, "cancelled": cancelled})
 
 
 def send_one(
@@ -1954,6 +1988,9 @@ def run_batch(
             if item.ok:
                 if winner is None:
                     winner = item
+                    abort_polling.set()
+                    if transport_mode == TRANSPORT_CODEX_CLI:
+                        terminate_active_codex_processes()
                     logger.log(
                         "FIRST_RESULT batch=%s request=%s status=%s latency_ms=%s prompt=%s text=%s"
                         % (
@@ -1971,6 +2008,11 @@ def run_batch(
                     )
                     if on_winner is not None:
                         on_winner(item)
+            elif item.cancelled:
+                logger.log(
+                    "REQUEST_CANCELLED batch=%s request=%s reason=%s"
+                    % (item.round_no, item.index, item.error[:500])
+                )
             else:
                 failed_total += 1
                 logger.log(

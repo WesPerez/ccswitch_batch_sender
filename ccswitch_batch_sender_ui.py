@@ -690,7 +690,7 @@ class BatchSenderApp:
             "CLI 并发",
             self.cli_concurrency_var,
             1,
-            8,
+            10,
         )
 
         self._editable_ttk.extend(
@@ -1306,9 +1306,14 @@ class BatchSenderApp:
         if event.kind == "round_start":
             self.progress_text_var.set(f"第 {event.round_no}/{event.max_rounds} 批正在发送")
         elif event.kind == "first_success" and event.winner is not None:
-            self.progress_text_var.set(
-                f"第 {event.round_no} 批 #{event.winner.index} 先返回，其余请求继续收尾"
-            )
+            if self.last_run_config and self.last_run_config.get("transport_mode") == TRANSPORT_CODEX_CLI:
+                message = (
+                    f"第 {event.round_no} 批 #{event.winner.index} 成功，已终止本地同批任务；"
+                    "上游在途请求仍可能计费"
+                )
+            else:
+                message = f"第 {event.round_no} 批 #{event.winner.index} 成功，已取消同批后续轮询"
+            self.progress_text_var.set(message)
             self._set_status("success")
         elif event.kind == "retry_wait":
             self.progress_text_var.set(f"第 {event.round_no} 批无成功响应，{event.message}")
@@ -1595,7 +1600,8 @@ class BatchSenderApp:
         if self.running or self.blocked_by_unfinished:
             if not messagebox.askyesno(
                 "关闭应用",
-                "仍有任务在运行。关闭会中断这些连接，是否继续？",
+                "仍有任务在运行。关闭会终止本应用启动的本地任务；"
+                "已进入上游的请求仍可能完成并计费。是否继续？",
                 parent=self.root,
             ):
                 return

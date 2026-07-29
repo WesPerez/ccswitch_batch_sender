@@ -108,9 +108,9 @@ class ConfigTests(unittest.TestCase):
     def test_default_uses_random_real_probes(self) -> None:
         config = sender.normalize_config()
         self.assertEqual(config["transport_mode"], sender.TRANSPORT_CODEX_CLI)
-        self.assertEqual(config["cli_concurrency"], 4)
-        self.assertEqual(config["request_count"], 5)
-        self.assertEqual(config["retry_count"], 5)
+        self.assertEqual(config["cli_concurrency"], 10)
+        self.assertEqual(config["request_count"], 10)
+        self.assertEqual(config["retry_count"], 2)
         self.assertTrue(config["random_probe_enabled"])
         self.assertGreaterEqual(config["max_output_tokens"], 32)
 
@@ -123,17 +123,32 @@ class ConfigTests(unittest.TestCase):
     def test_v2_saved_custom_json_stays_on_direct_transport(self) -> None:
         migrated = sender.migrate_saved_config({"custom_body_enabled": True}, 2)
         self.assertEqual(migrated["transport_mode"], sender.TRANSPORT_DIRECT)
-        self.assertEqual(migrated["cli_concurrency"], 4)
+        self.assertEqual(migrated["cli_concurrency"], 10)
 
     def test_v3_saved_defaults_migrate_to_new_batch_defaults(self) -> None:
         migrated = sender.migrate_saved_config({"request_count": 20, "retry_count": 0}, 3)
-        self.assertEqual(migrated["request_count"], 5)
-        self.assertEqual(migrated["retry_count"], 5)
+        self.assertEqual(migrated["request_count"], 10)
+        self.assertEqual(migrated["retry_count"], 2)
+        self.assertEqual(migrated["cli_concurrency"], 10)
 
     def test_v3_custom_batch_values_are_preserved(self) -> None:
         migrated = sender.migrate_saved_config({"request_count": 8, "retry_count": 2}, 3)
         self.assertEqual(migrated["request_count"], 8)
         self.assertEqual(migrated["retry_count"], 2)
+
+    def test_v4_saved_defaults_migrate_to_current_defaults(self) -> None:
+        migrated = sender.migrate_saved_config(
+            {"request_count": 5, "retry_count": 5, "cli_concurrency": 4},
+            4,
+        )
+        self.assertEqual(migrated["request_count"], 10)
+        self.assertEqual(migrated["retry_count"], 2)
+        self.assertEqual(migrated["cli_concurrency"], 10)
+
+    def test_cli_concurrency_accepts_ten_and_rejects_more(self) -> None:
+        self.assertEqual(sender.normalize_config({"cli_concurrency": 10})["cli_concurrency"], 10)
+        with self.assertRaises(sender.SenderError):
+            sender.normalize_config({"cli_concurrency": 11})
 
     def test_custom_body_can_replace_the_prompt(self) -> None:
         config = sender.normalize_config(
@@ -468,16 +483,24 @@ class ProtocolTests(unittest.TestCase):
             [sys.executable, "-c", "import time; time.sleep(30)"],
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        unrelated = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
         sender.ACTIVE_CODEX_PROCESSES.register(process)
         try:
             sender.terminate_active_codex_processes()
             process.wait(timeout=3)
             self.assertIsNotNone(process.returncode)
+            self.assertIsNone(unrelated.poll())
             self.assertEqual(sender.ACTIVE_CODEX_PROCESSES.count(), 0)
         finally:
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=3)
+            if unrelated.poll() is None:
+                unrelated.kill()
+                unrelated.wait(timeout=3)
             sender.ACTIVE_CODEX_PROCESSES.discard(process)
 
     def test_codex_cli_errors_redact_provider_key(self) -> None:
@@ -620,7 +643,7 @@ class RunnerTests(unittest.TestCase):
         run_start = next(line for line in lines if "RUN_START" in line)
         self.assertIn("task_mode=random", run_start)
         self.assertIn("transport=official-codex-cli", run_start)
-        self.assertIn("cli_concurrency=4", run_start)
+        self.assertIn("cli_concurrency=10", run_start)
         self.assertNotIn("third-party", run_start)
         self.assertNotIn("random-probe", run_start)
 
@@ -674,6 +697,52 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(outcome.code, 1)
         self.assertNotIn(self.provider.api_key, "\n".join(lines))
         self.assertIn("<redacted>", "\n".join(lines))
+
+    def test_first_cli_success_cancels_the_other_tasks(self) -> None:
+        cancelled: list[int] = []
+        lock = threading.Lock()
+
+        def fake_sender(index, provider, config, deadline, logger, abort_polling, *, round_no=1):
+            if index == 1:
+                return sender.AttemptResult(
+                    index=index,
+                    round_no=round_no,
+                    ok=True,
+                    status=200,
+                    text="ok",
+                    provider_name=provider.name,
+                )
+            if abort_polling.wait(timeout=2):
+                with lock:
+                    cancelled.append(index)
+                return sender.AttemptResult(
+                    index=index,
+                    round_no=round_no,
+                    ok=False,
+                    error="Codex CLI 任务已被取消。",
+                    provider_name=provider.name,
+                    cancelled=True,
+                )
+            return sender.AttemptResult(index=index, round_no=round_no, ok=False, status=504, error="timeout")
+
+        config = sender.normalize_config(
+            {
+                "transport_mode": sender.TRANSPORT_CODEX_CLI,
+                "request_count": 3,
+                "retry_count": 0,
+            }
+        )
+        with mock.patch.object(sender, "terminate_active_codex_processes") as terminate:
+            outcome = sender.run_batch(
+                config,
+                sender.RunLogger(callback=lambda _line: None),
+                provider_loader=lambda _config: self.provider,
+                sender=fake_sender,
+            )
+        self.assertEqual(outcome.code, 0)
+        self.assertEqual(outcome.failed, 0)
+        self.assertEqual(set(cancelled), {2, 3})
+        terminate.assert_called_once_with()
 
 
 if __name__ == "__main__":
