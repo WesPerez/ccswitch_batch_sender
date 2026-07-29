@@ -14,6 +14,9 @@ from tkinter import filedialog, messagebox, ttk
 from ccswitch_batch_sender import (
     APP_TITLE,
     DEFAULT_CONFIG,
+    LEGACY_RANDOM_PROBE_PLACEHOLDER,
+    PROMPT_CACHE_KEY_PLACEHOLDER,
+    RANDOM_TASK_PLACEHOLDER,
     AttemptResult,
     ProgressEvent,
     Provider,
@@ -24,6 +27,7 @@ from ccswitch_batch_sender import (
     SenderError,
     build_preview_body,
     build_result_dict,
+    detect_codex_cli_version,
     endpoint_candidates,
     list_codex_providers,
     load_provider,
@@ -117,6 +121,7 @@ class IconStore:
         "app": "assets/app-32.png",
         "send": "assets/send-light.png",
         "stop": "assets/square-dark.png",
+        "check-square": "assets/square-check-dark.png",
         "refresh": "assets/refresh-dark.png",
         "save": "assets/save-dark.png",
         "copy": "assets/copy-dark.png",
@@ -308,6 +313,22 @@ class BatchSenderApp:
         style.map("TCheckbutton", background=[("active", SURFACE)])
         style.configure("Compact.TCheckbutton", background=SURFACE, foreground=TEXT, font=FONT_SMALL)
         style.map("Compact.TCheckbutton", background=[("active", SURFACE)])
+        for name, font in (("Icon.TCheckbutton", FONT_BODY), ("IconCompact.TCheckbutton", FONT_SMALL)):
+            style.configure(name, background=SURFACE, foreground=TEXT, font=font, padding=(0, 1))
+            style.map(name, background=[("active", SURFACE)], foreground=[("disabled", "#9AA39E")])
+            style.layout(
+                name,
+                [
+                    (
+                        "Checkbutton.padding",
+                        {
+                            "sticky": "nswe",
+                            "children": [("Checkbutton.label", {"sticky": "nswe"})],
+                        },
+                    )
+                ],
+            )
+        style.configure("Managed.TLabel", background=SURFACE, foreground=ACCENT, font=FONT_SMALL)
         style.configure("TNotebook", background=SURFACE, borderwidth=0, tabmargins=0)
         style.configure(
             "TNotebook.Tab",
@@ -336,6 +357,7 @@ class BatchSenderApp:
         self.provider_var = tk.StringVar()
         self.provider_meta_var = tk.StringVar(value="正在读取 CC Switch provider")
         self.provider_state_var = tk.StringVar(value="")
+        self.random_probe_var = tk.BooleanVar()
         self.request_count_var = tk.StringVar()
         self.retry_count_var = tk.StringVar()
         self.retry_interval_var = tk.StringVar()
@@ -347,8 +369,10 @@ class BatchSenderApp:
         self.max_wait_var = tk.StringVar()
         self.poll_interval_var = tk.StringVar()
         self.unique_cache_var = tk.BooleanVar()
+        self.send_codex_version_var = tk.BooleanVar()
         self.save_full_response_var = tk.BooleanVar()
         self.custom_body_var = tk.BooleanVar()
+        self.body_mode_var = tk.StringVar(value="自动生成 · 只读")
         self.limit_var = tk.StringVar()
         self.progress_text_var = tk.StringVar(value="未运行")
         self.metrics_var = tk.StringVar(value="已发送 0 · 已完成 0 · 失败 0")
@@ -473,7 +497,18 @@ class BatchSenderApp:
     def _build_common_settings(self, parent: ttk.Frame) -> None:
         parent.grid_columnconfigure(0, weight=1)
         parent.grid_rowconfigure(1, weight=1)
-        ttk.Label(parent, text="提示词", style="Field.TLabel").grid(row=0, column=0, sticky="w")
+        prompt_header = ttk.Frame(parent, style="Surface.TFrame")
+        prompt_header.grid(row=0, column=0, sticky="ew")
+        prompt_header.grid_columnconfigure(0, weight=1)
+        ttk.Label(prompt_header, text="固定提示词", style="Field.TLabel").grid(row=0, column=0, sticky="w")
+        self.random_probe_check = self._checkbutton(
+            prompt_header,
+            "每次随机任务",
+            self.random_probe_var,
+            compact=True,
+        )
+        self.random_probe_check.grid(row=0, column=1, sticky="e")
+        self._editable_ttk.append(self.random_probe_check)
         self.prompt_text = tk.Text(
             parent,
             height=4,
@@ -545,22 +580,32 @@ class BatchSenderApp:
 
         options_line = ttk.Frame(parent, style="Surface.TFrame")
         options_line.grid(row=2, column=0, columnspan=2, sticky="ew")
-        options_line.grid_columnconfigure(0, weight=1)
+        options_line.grid_columnconfigure(0, weight=1, minsize=54)
         ttk.Label(options_line, text="地址覆盖", style="Field.TLabel").grid(row=0, column=0, sticky="w")
-        self.unique_check = ttk.Checkbutton(
+        self.unique_check = self._checkbutton(
             options_line,
-            text="唯一缓存键",
-            variable=self.unique_cache_var,
-            style="Compact.TCheckbutton",
+            "唯一缓存",
+            self.unique_cache_var,
+            compact=True,
         )
         self.unique_check.grid(row=0, column=1, sticky="e", padx=(8, 0))
-        self.full_response_check = ttk.Checkbutton(
+        Tooltip(self.unique_check, "为每个请求生成不同的 prompt_cache_key")
+        self.full_response_check = self._checkbutton(
             options_line,
-            text="完整响应",
-            variable=self.save_full_response_var,
-            style="Compact.TCheckbutton",
+            "完整响应",
+            self.save_full_response_var,
+            compact=True,
         )
         self.full_response_check.grid(row=0, column=2, sticky="e", padx=(8, 0))
+        Tooltip(self.full_response_check, "导出结果时包含完整响应")
+        self.codex_version_check = self._checkbutton(
+            options_line,
+            "Codex 版本",
+            self.send_codex_version_var,
+            compact=True,
+        )
+        self.codex_version_check.grid(row=0, column=3, sticky="e", padx=(8, 0))
+        Tooltip(self.codex_version_check, "向 provider 附带本机 Codex CLI 版本请求头")
         self.base_url_entry = ttk.Entry(parent, textvariable=self.base_url_override_var)
         self.base_url_entry.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 9))
 
@@ -603,6 +648,7 @@ class BatchSenderApp:
                 self.max_wait_spin,
                 self.unique_check,
                 self.full_response_check,
+                self.codex_version_check,
             ]
         )
 
@@ -611,18 +657,21 @@ class BatchSenderApp:
         parent.grid_rowconfigure(1, weight=1)
         toolbar = ttk.Frame(parent, style="Surface.TFrame")
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        toolbar.grid_columnconfigure(0, weight=1)
-        self.custom_body_check = ttk.Checkbutton(
+        toolbar.grid_columnconfigure(1, weight=1)
+        self.custom_body_check = self._checkbutton(
             toolbar,
-            text="自定义 JSON",
-            variable=self.custom_body_var,
+            "自定义 JSON",
+            self.custom_body_var,
             command=self.toggle_custom_body,
         )
         self.custom_body_check.grid(row=0, column=0, sticky="w")
+        self.body_mode_label = ttk.Label(toolbar, textvariable=self.body_mode_var, style="Managed.TLabel")
+        self.body_mode_label.grid(row=0, column=1, sticky="w", padx=(10, 0))
+        Tooltip(self.body_mode_label, "高亮占位符会在每个请求发送前由应用替换")
         self.body_copy_button = self._tool_button(toolbar, "copy", self.copy_request_body, "复制请求体")
-        self.body_copy_button.grid(row=0, column=1, padx=(6, 0))
+        self.body_copy_button.grid(row=0, column=2, padx=(6, 0))
         self.body_reset_button = self._tool_button(toolbar, "reset", self.reset_request_body, "恢复自动生成")
-        self.body_reset_button.grid(row=0, column=2, padx=(6, 0))
+        self.body_reset_button.grid(row=0, column=3, padx=(6, 0))
         self._editable_ttk.extend([self.custom_body_check, self.body_reset_button])
 
         frame = tk.Frame(parent, bg=SURFACE)
@@ -647,6 +696,7 @@ class BatchSenderApp:
         body_y = ttk.Scrollbar(frame, orient="vertical", command=self.body_text.yview)
         body_x = ttk.Scrollbar(frame, orient="horizontal", command=self.body_text.xview)
         self.body_text.configure(yscrollcommand=body_y.set, xscrollcommand=body_x.set)
+        self.body_text.tag_configure("managed", foreground="#B9F0D0", background="#24483B")
         self.body_text.grid(row=0, column=0, sticky="nsew")
         body_y.grid(row=0, column=1, sticky="ns")
         body_x.grid(row=1, column=0, sticky="ew")
@@ -723,7 +773,7 @@ class BatchSenderApp:
         self.result_export_button.state(["disabled"])
         self.result_text = tk.Text(
             frame,
-            height=3,
+            height=4,
             wrap="word",
             state="disabled",
             bg=SURFACE_SOFT,
@@ -774,6 +824,28 @@ class BatchSenderApp:
             options.update({"image": image, "compound": "left"})
         return ttk.Button(parent, **options)
 
+    def _checkbutton(
+        self,
+        parent: tk.Misc,
+        text: str,
+        variable: tk.BooleanVar,
+        *,
+        compact: bool = False,
+        command: Callable[[], None] | None = None,
+    ) -> ttk.Checkbutton:
+        options: dict[str, Any] = {
+            "text": text,
+            "variable": variable,
+            "style": "IconCompact.TCheckbutton" if compact else "Icon.TCheckbutton",
+        }
+        if command is not None:
+            options["command"] = command
+        unchecked = self.icons.get("stop")
+        checked = self.icons.get("check-square")
+        if unchecked is not None and checked is not None:
+            options.update({"image": (unchecked, "selected", checked), "compound": "left"})
+        return ttk.Checkbutton(parent, **options)
+
     def _tool_button(
         self,
         parent: tk.Misc,
@@ -812,7 +884,9 @@ class BatchSenderApp:
         ):
             variable.trace_add("write", lambda *_args: self.schedule_preview())
         self.unique_cache_var.trace_add("write", lambda *_args: self.schedule_preview())
+        self.send_codex_version_var.trace_add("write", lambda *_args: self.schedule_preview())
         self.save_full_response_var.trace_add("write", lambda *_args: self.schedule_preview())
+        self.random_probe_var.trace_add("write", lambda *_args: self.schedule_preview())
         self.root.bind("<Control-Return>", lambda _event: self.start_run())
         self.root.bind("<Escape>", lambda _event: self.stop_run())
         self.root.bind("<F5>", lambda _event: self.refresh_providers())
@@ -821,6 +895,7 @@ class BatchSenderApp:
     def _load_initial_values(self) -> None:
         config = self.base_config
         self._replace_text(self.prompt_text, str(config["message"]))
+        self.random_probe_var.set(bool(config["random_probe_enabled"]))
         self.request_count_var.set(str(config["request_count"]))
         self.retry_count_var.set(str(config["retry_count"]))
         self.retry_interval_var.set(self._number_text(config["retry_interval_seconds"]))
@@ -832,6 +907,7 @@ class BatchSenderApp:
         self.max_wait_var.set(self._number_text(config["max_wait_seconds"]))
         self.poll_interval_var.set(self._number_text(config["poll_interval_seconds"]))
         self.unique_cache_var.set(bool(config["unique_prompt_cache_key"]))
+        self.send_codex_version_var.set(bool(config["send_codex_version_header"]))
         self.save_full_response_var.set(bool(config["save_full_response"]))
         self.custom_body_var.set(bool(config["custom_body_enabled"]))
         if self.custom_body_var.get() and isinstance(config.get("custom_body"), dict):
@@ -839,6 +915,7 @@ class BatchSenderApp:
             self.body_text.configure(state="normal")
         else:
             self.body_text.configure(state="disabled")
+        self._update_body_management()
         self._update_limit_text()
 
     @staticmethod
@@ -912,6 +989,7 @@ class BatchSenderApp:
     def _on_body_modified(self, _event: tk.Event[Any]) -> None:
         if self.body_text.edit_modified():
             self.body_text.edit_modified(False)
+            self._update_body_management()
             if self.custom_body_var.get():
                 self.schedule_preview()
 
@@ -934,9 +1012,11 @@ class BatchSenderApp:
                 self._set_body_text(json.dumps(body, ensure_ascii=False, indent=2), editable=False)
             else:
                 self.body_text.configure(state="normal")
+                self._update_body_management()
             host = urllib.parse.urlsplit(provider.base_url).netloc or provider.base_url
             format_label = "Responses" if provider.api_format == "openai_responses" else "Chat Completions"
-            self.provider_meta_var.set(f"{provider.model}  ·  {format_label}  ·  {host}")
+            codex_version = detect_codex_cli_version().version or "未检测"
+            self.provider_meta_var.set(f"{provider.model}  ·  {format_label}  ·  {host}  ·  Codex CLI {codex_version}")
             if self._selected_provider_id() == "current":
                 self.provider_state_var.set("跟随 CC Switch")
             else:
@@ -959,6 +1039,7 @@ class BatchSenderApp:
                 "model": self.model_override_var.get().strip(),
                 "base_url": self.base_url_override_var.get().strip(),
                 "message": self.prompt_text.get("1.0", "end-1c"),
+                "random_probe_enabled": self.random_probe_var.get(),
                 "request_count": self.request_count_var.get(),
                 "retry_count": self.retry_count_var.get(),
                 "retry_interval_seconds": self.retry_interval_var.get(),
@@ -968,6 +1049,7 @@ class BatchSenderApp:
                 "poll_interval_seconds": self.poll_interval_var.get(),
                 "endpoint_style": ENDPOINT_LABELS.get(self.endpoint_style_var.get(), "auto"),
                 "unique_prompt_cache_key": self.unique_cache_var.get(),
+                "send_codex_version_header": self.send_codex_version_var.get(),
                 "save_full_response": self.save_full_response_var.get(),
                 "custom_body_enabled": self.custom_body_var.get(),
             }
@@ -1112,7 +1194,11 @@ class BatchSenderApp:
     def show_winner(self, result: AttemptResult) -> None:
         self.latest_result = result
         text = result.text.strip() or "已收到成功响应"
-        summary = f"第 {result.round_no} 批 #{result.index} · HTTP {result.status or '-'} · {result.latency_ms} ms\n{text}"
+        lines = [f"第 {result.round_no} 批 #{result.index} · HTTP {result.status or '-'} · {result.latency_ms} ms"]
+        if result.request_prompt:
+            lines.append(f"请求：{result.request_prompt}")
+        lines.append(f"响应：{text}")
+        summary = "\n".join(lines)
         self.result_title_var.set("首个成功结果")
         self._set_readonly_text(self.result_text, summary)
         self.result_copy_button.state(["!disabled"])
@@ -1319,7 +1405,36 @@ class BatchSenderApp:
         self.body_text.delete("1.0", "end")
         self.body_text.insert("1.0", text)
         self.body_text.edit_modified(False)
+        self._update_body_management()
         self.body_text.configure(state="normal" if editable else "disabled")
+
+    def _update_body_management(self) -> None:
+        self.body_text.tag_remove("managed", "1.0", "end")
+        found = False
+        for placeholder in (
+            PROMPT_CACHE_KEY_PLACEHOLDER,
+            RANDOM_TASK_PLACEHOLDER,
+            LEGACY_RANDOM_PROBE_PLACEHOLDER,
+        ):
+            needle = json.dumps(placeholder, ensure_ascii=False)
+            start = "1.0"
+            while True:
+                index = self.body_text.search(needle, start, stopindex="end")
+                if not index:
+                    break
+                line = index.split(".", 1)[0]
+                self.body_text.tag_add("managed", f"{line}.0", f"{line}.end")
+                start = f"{index}+{len(needle)}c"
+                found = True
+        if not self.custom_body_var.get():
+            self.body_mode_var.set("自动生成 · 只读")
+            self.body_mode_label.configure(style="Meta.TLabel")
+        elif found:
+            self.body_mode_var.set("高亮占位符发送时自动替换")
+            self.body_mode_label.configure(style="Managed.TLabel")
+        else:
+            self.body_mode_var.set("自定义内容原样发送")
+            self.body_mode_label.configure(style="Meta.TLabel")
 
     @staticmethod
     def _replace_text(widget: tk.Text, text: str) -> None:

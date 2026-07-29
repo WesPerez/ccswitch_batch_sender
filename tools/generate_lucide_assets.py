@@ -57,6 +57,11 @@ def square(draw: ImageDraw.ImageDraw, size: int, color: tuple[int, int, int, int
     )
 
 
+def square_check(draw: ImageDraw.ImageDraw, size: int, color: tuple[int, int, int, int]) -> None:
+    square(draw, size, color)
+    line(draw, size, [(7, 12), (10.5, 15.5), (17.5, 8.5)], color)
+
+
 def refresh(draw: ImageDraw.ImageDraw, size: int, color: tuple[int, int, int, int]) -> None:
     box = (point(3, size), point(3, size), point(21, size), point(21, size))
     draw.arc(box, start=205, end=390, fill=color, width=width(2))
@@ -135,6 +140,7 @@ def main() -> None:
     # The geometry follows the corresponding Lucide icons at a 24x24 viewBox.
     save_icon("send-light.png", send, WHITE)
     save_icon("square-dark.png", square, INK)
+    save_icon("square-check-dark.png", square_check, ACCENT)
     save_icon("refresh-dark.png", refresh, INK)
     save_icon("save-dark.png", save, INK)
     save_icon("copy-dark.png", copy_icon, INK)

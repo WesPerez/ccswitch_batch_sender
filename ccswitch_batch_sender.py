@@ -4,11 +4,15 @@ import argparse
 import copy
 import ctypes
 import datetime as dt
+import functools
 import json
 import os
 import queue
+import random
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -23,32 +27,42 @@ from typing import Any, Callable, Iterable
 
 APP_NAME = "CC Switch Batch Sender"
 APP_TITLE = "CC Switch 批量请求"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.1"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".cc-switch" / "cc-switch.db"
 REGISTRY_PATH = r"Software\CCSwitchBatchSender"
 REGISTRY_VALUE = "SettingsJson"
 REGISTRY_SCHEMA_VALUE = "SchemaVersion"
+REGISTRY_SCHEMA_VERSION = 2
 MUTEX_NAME = r"Local\CCSwitchBatchSender.App"
+PROMPT_CACHE_KEY_PLACEHOLDER = "<每个请求唯一>"
+RANDOM_TASK_PLACEHOLDER = "<每个请求随机任务>"
+LEGACY_RANDOM_PROBE_PLACEHOLDER = "<每个请求随机探针>"
+RANDOM_PROBE_PLACEHOLDER = RANDOM_TASK_PLACEHOLDER
+RANDOM_TASK_PLACEHOLDERS = (RANDOM_TASK_PLACEHOLDER, LEGACY_RANDOM_PROBE_PLACEHOLDER)
+DEFAULT_FIXED_MESSAGE = "请说明批量请求为什么需要超时。"
+CODEX_VERSION_HEADER = "X-CCSwitch-Local-Codex-CLI-Version"
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "provider_id": "current",
     "model": "",
     "base_url": "",
-    "message": "1",
+    "message": DEFAULT_FIXED_MESSAGE,
+    "random_probe_enabled": True,
     "request_count": 20,
     "retry_count": 0,
-    "max_output_tokens": 1,
+    "max_output_tokens": 64,
     "request_timeout_seconds": 7200,
     "max_wait_seconds": 7200,
     "retry_interval_seconds": 3,
     "poll_interval_seconds": 2,
-    "user_agent": f"{APP_NAME}/{APP_VERSION}",
+    "user_agent": f"{APP_NAME}/{APP_VERSION} (non-codex)",
     "originator": APP_NAME,
     "db_path": "",
     "endpoint_style": "auto",
     "unique_prompt_cache_key": True,
+    "send_codex_version_header": True,
     "save_full_response": False,
     "custom_body_enabled": False,
     "custom_body": None,
@@ -58,6 +72,7 @@ PERSISTED_KEYS = (
     "model",
     "base_url",
     "message",
+    "random_probe_enabled",
     "request_count",
     "retry_count",
     "max_output_tokens",
@@ -67,6 +82,7 @@ PERSISTED_KEYS = (
     "poll_interval_seconds",
     "endpoint_style",
     "unique_prompt_cache_key",
+    "send_codex_version_header",
     "save_full_response",
     "custom_body_enabled",
     "custom_body",
@@ -106,6 +122,18 @@ class ProviderCatalog:
     providers: tuple[ProviderSummary, ...]
 
 
+@dataclass(frozen=True)
+class ProbeCase:
+    prompt: str
+    expected: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class CodexCliVersion:
+    version: str = ""
+    source: str = "unavailable"
+
+
 @dataclass
 class AttemptResult:
     index: int
@@ -118,6 +146,7 @@ class AttemptResult:
     latency_ms: int = 0
     payload: Any = None
     provider_name: str = ""
+    request_prompt: str = ""
     pending: bool = False
     response_headers: dict[str, str] = field(default_factory=dict)
 
@@ -149,6 +178,13 @@ class RunOutcome:
     unfinished: int = 0
 
 
+def _console_print(message: str, *, error: bool = False) -> None:
+    stream = sys.stderr if error else sys.stdout
+    if stream is None:
+        return
+    print(message, file=stream, flush=True)
+
+
 class RunLogger:
     def __init__(
         self,
@@ -171,7 +207,7 @@ class RunLogger:
         if self._callback is not None:
             self._callback(line)
         elif self.path is None:
-            print(line, flush=True)
+            _console_print(line)
 
 
 class SingleInstanceMutex:
@@ -244,6 +280,7 @@ def normalize_config(values: dict[str, Any] | None = None) -> dict[str, Any]:
         "model": str(raw.get("model", "")).strip(),
         "base_url": str(raw.get("base_url", "")).strip().rstrip("/"),
         "message": str(raw.get("message", "")),
+        "random_probe_enabled": bool(raw.get("random_probe_enabled", True)),
         "request_count": _coerce_int(raw.get("request_count"), "请求次数"),
         "retry_count": _coerce_int(raw.get("retry_count"), "重试次数"),
         "max_output_tokens": _coerce_int(raw.get("max_output_tokens"), "最大输出 token"),
@@ -256,6 +293,7 @@ def normalize_config(values: dict[str, Any] | None = None) -> dict[str, Any]:
         "db_path": str(raw.get("db_path", "")).strip(),
         "endpoint_style": str(raw.get("endpoint_style", "auto")).strip().lower(),
         "unique_prompt_cache_key": bool(raw.get("unique_prompt_cache_key", True)),
+        "send_codex_version_header": bool(raw.get("send_codex_version_header", True)),
         "save_full_response": bool(raw.get("save_full_response", False)),
         "custom_body_enabled": bool(raw.get("custom_body_enabled", False)),
         "custom_body": copy.deepcopy(raw.get("custom_body")),
@@ -288,7 +326,7 @@ def normalize_config(values: dict[str, Any] | None = None) -> dict[str, Any]:
     if config["custom_body_enabled"]:
         if not isinstance(custom_body, dict):
             raise SenderError("自定义请求体必须是 JSON 对象。")
-    elif not config["message"].strip():
+    elif not config["random_probe_enabled"] and not config["message"].strip():
         raise SenderError("提示词不能为空。")
     elif custom_body is not None and not isinstance(custom_body, dict):
         config["custom_body"] = None
@@ -307,6 +345,17 @@ def load_json_config(path: Path) -> dict[str, Any]:
     return normalize_config(loaded)
 
 
+def migrate_saved_config(values: dict[str, Any], schema_version: int) -> dict[str, Any]:
+    migrated = copy.deepcopy(values)
+    if schema_version < 2:
+        migrated.setdefault("random_probe_enabled", True)
+        if str(migrated.get("message", "")).strip() in {"", "1"}:
+            migrated["message"] = DEFAULT_FIXED_MESSAGE
+        if migrated.get("max_output_tokens") in {None, 1, "1"}:
+            migrated["max_output_tokens"] = DEFAULT_CONFIG["max_output_tokens"]
+    return migrated
+
+
 def load_saved_config() -> dict[str, Any]:
     if os.name != "nt":
         return normalize_config()
@@ -315,10 +364,14 @@ def load_saved_config() -> dict[str, Any]:
 
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REGISTRY_PATH) as key:
             raw, _ = winreg.QueryValueEx(key, REGISTRY_VALUE)
+            try:
+                schema_version, _ = winreg.QueryValueEx(key, REGISTRY_SCHEMA_VALUE)
+            except FileNotFoundError:
+                schema_version = 0
         loaded = json.loads(str(raw))
         if not isinstance(loaded, dict):
             return normalize_config()
-        return normalize_config(loaded)
+        return normalize_config(migrate_saved_config(loaded, int(schema_version)))
     except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError, SenderError):
         return normalize_config()
 
@@ -335,7 +388,7 @@ def save_saved_config(config: dict[str, Any]) -> None:
 
     payload = persistent_config_payload(config)
     with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, REGISTRY_PATH, 0, winreg.KEY_WRITE) as key:
-        winreg.SetValueEx(key, REGISTRY_SCHEMA_VALUE, 0, winreg.REG_DWORD, 1)
+        winreg.SetValueEx(key, REGISTRY_SCHEMA_VALUE, 0, winreg.REG_DWORD, REGISTRY_SCHEMA_VERSION)
         winreg.SetValueEx(
             key,
             REGISTRY_VALUE,
@@ -603,19 +656,226 @@ def endpoint_candidates(provider: Provider, style: str) -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
+def parse_codex_cli_version(raw: str) -> str:
+    match = re.search(r"\b(?:codex-cli\s+)?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b", raw or "")
+    return match.group(1) if match else ""
+
+
+def _read_codex_package_version(path: Path) -> str:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return parse_codex_cli_version(str(payload.get("version") or ""))
+
+
+@functools.lru_cache(maxsize=1)
+def detect_codex_cli_version() -> CodexCliVersion:
+    command = shutil.which("codex")
+    package_candidates: list[Path] = []
+    if command:
+        package_candidates.append(Path(command).resolve().parent / "node_modules" / "@openai" / "codex" / "package.json")
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        package_candidates.append(Path(appdata) / "npm" / "node_modules" / "@openai" / "codex" / "package.json")
+
+    for candidate in dict.fromkeys(package_candidates):
+        version = _read_codex_package_version(candidate)
+        if version:
+            return CodexCliVersion(version=version, source="npm-package")
+
+    if command:
+        try:
+            completed = subprocess.run(
+                [command, "--version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=3,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            version = parse_codex_cli_version((completed.stdout or "") + "\n" + (completed.stderr or ""))
+            if completed.returncode == 0 and version:
+                return CodexCliVersion(version=version, source="codex-command")
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return CodexCliVersion()
+
+
+def build_request_headers(
+    provider: Provider,
+    config: dict[str, Any],
+    *,
+    codex_version: CodexCliVersion | None = None,
+) -> dict[str, str]:
+    version = codex_version if codex_version is not None else detect_codex_cli_version()
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + provider.api_key,
+        "User-Agent": str(config["user_agent"]),
+    }
+    if provider.api_format == "openai_responses":
+        headers["Originator"] = str(config["originator"])
+    if bool(config.get("send_codex_version_header", True)) and version.version:
+        headers[CODEX_VERSION_HEADER] = version.version
+    return headers
+
+
+def generate_probe_case(rng: random.Random | random.SystemRandom | None = None) -> ProbeCase:
+    randomizer = rng or random.SystemRandom()
+    kind = randomizer.randrange(4)
+    if kind == 0:
+        left = randomizer.randint(12, 89)
+        right = randomizer.randint(7, 64)
+        total = left + right
+        return ProbeCase(
+            prompt=(
+                f"计算 {left} + {right}，并判断结果是奇数还是偶数。"
+                "请只返回 JSON 对象，字段为 sum 和 parity，parity 使用 odd 或 even。"
+            ),
+            expected={"sum": total, "parity": "even" if total % 2 == 0 else "odd"},
+        )
+    if kind == 1:
+        values = randomizer.sample(range(3, 50), 4)
+        return ProbeCase(
+            prompt=(
+                f"将整数列表 {values} 按升序排列，并给出其中的最大值。"
+                "请只返回 JSON 对象，字段为 sorted 和 max。"
+            ),
+            expected={"sorted": sorted(values), "max": max(values)},
+        )
+    if kind == 2:
+        minutes = randomizer.randint(3, 24)
+        threshold = randomizer.randint(4, 20) * 60
+        seconds = minutes * 60
+        return ProbeCase(
+            prompt=(
+                f"把 {minutes} 分钟换算成秒，并判断结果是否大于 {threshold} 秒。"
+                "请只返回 JSON 对象，字段为 seconds 和 greater_than。"
+            ),
+            expected={"seconds": seconds, "greater_than": seconds > threshold},
+        )
+    word = randomizer.choice(("cache", "router", "signal", "thread", "window", "provider"))
+    return ProbeCase(
+        prompt=(
+            f"将英文单词 {word} 转换为大写，并给出它的字母数量。"
+            "请只返回 JSON 对象，字段为 uppercase 和 length。"
+        ),
+        expected={"uppercase": word.upper(), "length": len(word)},
+    )
+
+
+def _contains_exact_placeholder(value: Any, placeholder: str) -> bool:
+    if value == placeholder:
+        return True
+    if isinstance(value, dict):
+        return any(_contains_exact_placeholder(item, placeholder) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_exact_placeholder(item, placeholder) for item in value)
+    return False
+
+
+def _replace_exact_placeholder(value: Any, placeholder: str, replacement: str) -> Any:
+    if value == placeholder:
+        return replacement
+    if isinstance(value, dict):
+        return {key: _replace_exact_placeholder(item, placeholder, replacement) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_replace_exact_placeholder(item, placeholder, replacement) for item in value]
+    return value
+
+
+def request_uses_random_probe(config: dict[str, Any]) -> bool:
+    if bool(config.get("custom_body_enabled")):
+        return any(
+            _contains_exact_placeholder(config.get("custom_body"), placeholder)
+            for placeholder in RANDOM_TASK_PLACEHOLDERS
+        )
+    return bool(config.get("random_probe_enabled", True))
+
+
+def _parse_json_object_from_text(text: str) -> dict[str, Any] | None:
+    candidate = (text or "").strip()
+    if candidate.startswith("```"):
+        lines = candidate.splitlines()
+        if lines:
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        candidate = "\n".join(lines).strip()
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            parsed = json.loads(candidate[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _strict_json_equal(actual: Any, expected: Any) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _strict_json_equal(actual_item, expected_item)
+            for actual_item, expected_item in zip(actual, expected)
+        )
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            _strict_json_equal(actual[key], expected[key]) for key in expected
+        )
+    return actual == expected
+
+
+def validate_probe_response(text: str, probe: ProbeCase) -> tuple[bool, str]:
+    payload = _parse_json_object_from_text(text)
+    if payload is None:
+        return False, "返回内容不是 JSON 对象"
+    for key, expected in probe.expected.items():
+        if key not in payload:
+            return False, f"缺少字段 {key}"
+        actual = payload[key]
+        if not _strict_json_equal(actual, expected):
+            return False, f"字段 {key} 的值不符合预期"
+    return True, ""
+
+
 def build_body(
     provider: Provider,
     config: dict[str, Any],
     *,
     cache_key: str | None = None,
+    request_prompt: str | None = None,
 ) -> dict[str, Any]:
     if bool(config.get("custom_body_enabled")):
         body = config.get("custom_body")
         if not isinstance(body, dict):
             raise SenderError("自定义请求体必须是 JSON 对象。")
-        return copy.deepcopy(body)
+        copied = copy.deepcopy(body)
+        if copied.get("prompt_cache_key") == PROMPT_CACHE_KEY_PLACEHOLDER:
+            copied["prompt_cache_key"] = cache_key or str(uuid.uuid4())
+        if any(_contains_exact_placeholder(copied, placeholder) for placeholder in RANDOM_TASK_PLACEHOLDERS):
+            prompt = request_prompt or generate_probe_case().prompt
+            for placeholder in RANDOM_TASK_PLACEHOLDERS:
+                copied = _replace_exact_placeholder(copied, placeholder, prompt)
+        return copied
 
-    message = str(config["message"])
+    if request_prompt is not None:
+        message = request_prompt
+    elif bool(config.get("random_probe_enabled", True)):
+        message = generate_probe_case().prompt
+    else:
+        message = str(config["message"])
     if provider.api_format == "openai_chat":
         return {
             "model": provider.model,
@@ -625,7 +885,6 @@ def build_body(
         }
     body: dict[str, Any] = {
         "model": provider.model,
-        "instructions": f"Return {message}.",
         "input": [
             {
                 "type": "message",
@@ -646,8 +905,27 @@ def build_body(
 
 
 def build_preview_body(provider: Provider, config: dict[str, Any]) -> dict[str, Any]:
-    key = "<每个请求唯一>" if bool(config.get("unique_prompt_cache_key", True)) else None
-    return build_body(provider, config, cache_key=key)
+    custom_body = config.get("custom_body") if bool(config.get("custom_body_enabled")) else None
+    custom_uses_key_placeholder = isinstance(custom_body, dict) and custom_body.get("prompt_cache_key") == PROMPT_CACHE_KEY_PLACEHOLDER
+    key = (
+        PROMPT_CACHE_KEY_PLACEHOLDER
+        if bool(config.get("unique_prompt_cache_key", True)) or custom_uses_key_placeholder
+        else None
+    )
+    prompt = RANDOM_TASK_PLACEHOLDER if request_uses_random_probe(config) else None
+    return build_body(provider, config, cache_key=key, request_prompt=prompt)
+
+
+def prepare_request_body(provider: Provider, config: dict[str, Any]) -> tuple[dict[str, Any], str, ProbeCase | None]:
+    probe = generate_probe_case() if request_uses_random_probe(config) else None
+    if probe is not None:
+        request_prompt = probe.prompt
+    elif bool(config.get("custom_body_enabled")):
+        request_prompt = ""
+    else:
+        request_prompt = str(config["message"])
+    body = build_body(provider, config, request_prompt=request_prompt or None)
+    return body, request_prompt, probe
 
 
 def _redact_url(url: str) -> str:
@@ -720,14 +998,7 @@ def _http_request(
     config: dict[str, Any],
     timeout: float,
 ) -> tuple[int | None, Any, dict[str, str], str]:
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Authorization": "Bearer " + provider.api_key,
-        "User-Agent": str(config["user_agent"]),
-    }
-    if provider.api_format == "openai_responses":
-        headers["Originator"] = str(config["originator"])
+    headers = build_request_headers(provider, config)
     data = None if body is None else json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
@@ -755,6 +1026,7 @@ def _poll_pending(
     deadline: float,
     logger: RunLogger,
     abort_event: threading.Event | None = None,
+    probe: ProbeCase | None = None,
 ) -> AttemptResult:
     payload = result.payload if isinstance(result.payload, dict) else {}
     location = result.response_headers.get("Location") or result.response_headers.get("location")
@@ -779,6 +1051,23 @@ def _poll_pending(
             continue
         if 200 <= status < 300 and not _is_pending(body, status):
             text = _extract_text(body)
+            if probe is not None:
+                valid, reason = validate_probe_response(text, probe)
+                if not valid:
+                    return AttemptResult(
+                        index=result.index,
+                        round_no=result.round_no,
+                        ok=False,
+                        status=status,
+                        text=text,
+                        error=f"随机任务语义校验失败：{reason}。",
+                        endpoint=poll_url,
+                        latency_ms=result.latency_ms,
+                        payload=body,
+                        provider_name=provider.name,
+                        request_prompt=result.request_prompt,
+                        response_headers=headers,
+                    )
             if text or isinstance(body, dict):
                 return AttemptResult(
                     index=result.index,
@@ -790,6 +1079,7 @@ def _poll_pending(
                     latency_ms=result.latency_ms,
                     payload=body,
                     provider_name=provider.name,
+                    request_prompt=result.request_prompt,
                     response_headers=headers,
                 )
         if status >= 400:
@@ -801,6 +1091,7 @@ def _poll_pending(
                 error=f"poll HTTP {status}: {str(body)[:500]}",
                 endpoint=poll_url,
                 provider_name=provider.name,
+                request_prompt=result.request_prompt,
             )
     reason = "轮询已停止。" if abort_event and abort_event.is_set() else "轮询超时。"
     return AttemptResult(**{**result.__dict__, "ok": False, "error": reason})
@@ -817,7 +1108,7 @@ def send_one(
     round_no: int = 1,
 ) -> AttemptResult:
     started = time.monotonic()
-    body = build_body(provider, config)
+    body, request_prompt, probe = prepare_request_body(provider, config)
     last_error = ""
     last_status: int | None = None
     last_payload: Any = None
@@ -844,6 +1135,7 @@ def send_one(
                     latency_ms=latency_ms,
                     payload=payload,
                     provider_name=provider.name,
+                    request_prompt=request_prompt,
                     response_headers=headers,
                 )
             state = str(payload.get("status") or "").lower() if isinstance(payload, dict) else ""
@@ -858,23 +1150,43 @@ def send_one(
                     latency_ms=latency_ms,
                     payload=payload,
                     provider_name=provider.name,
+                    request_prompt=request_prompt,
                     response_headers=headers,
                 )
+            response_text = _extract_text(payload)
+            if not _is_pending(payload, status) and probe is not None:
+                valid, reason = validate_probe_response(response_text, probe)
+                if not valid:
+                    return AttemptResult(
+                        index=index,
+                        round_no=round_no,
+                        ok=False,
+                        status=status,
+                        text=response_text,
+                        error=f"随机任务语义校验失败：{reason}。",
+                        endpoint=endpoint,
+                        latency_ms=latency_ms,
+                        payload=payload,
+                        provider_name=provider.name,
+                        request_prompt=request_prompt,
+                        response_headers=headers,
+                    )
             result = AttemptResult(
                 index=index,
                 round_no=round_no,
                 ok=not _is_pending(payload, status),
                 status=status,
-                text=_extract_text(payload),
+                text=response_text,
                 endpoint=endpoint,
                 latency_ms=latency_ms,
                 payload=payload,
                 provider_name=provider.name,
+                request_prompt=request_prompt,
                 pending=_is_pending(payload, status),
                 response_headers=headers,
             )
             if result.pending:
-                return _poll_pending(result, provider, config, deadline, logger, abort_polling)
+                return _poll_pending(result, provider, config, deadline, logger, abort_polling, probe)
             if result.text or isinstance(payload, dict):
                 return result
             return AttemptResult(**{**result.__dict__, "ok": False, "error": "HTTP 2xx 响应没有可用内容。"})
@@ -892,6 +1204,7 @@ def send_one(
         latency_ms=int((time.monotonic() - started) * 1000),
         payload=last_payload,
         provider_name=provider.name,
+        request_prompt=request_prompt,
     )
 
 
@@ -910,7 +1223,8 @@ def build_result_dict(
         "latency_ms": result.latency_ms,
         "endpoint": _redact_url(result.endpoint),
         "text": result.text,
-        "message": str(config["message"]),
+        "message": result.request_prompt
+        or ("" if bool(config.get("custom_body_enabled")) else str(config["message"])),
     }
     if isinstance(result.payload, dict):
         data["response_id"] = result.payload.get("id", "")
@@ -968,9 +1282,21 @@ def run_batch(
     completed_total = 0
     failed_total = 0
     winner: AttemptResult | None = None
+    codex_version = detect_codex_cli_version()
+    if bool(config.get("custom_body_enabled")):
+        task_mode = "custom-random" if request_uses_random_probe(config) else "custom"
+    else:
+        task_mode = "random" if request_uses_random_probe(config) else "fixed"
     logger.log(
-        "RUN_START count=%s retries=%s post_cap=%s"
-        % (request_count, config["retry_count"], total_cap)
+        "RUN_START count=%s retries=%s post_cap=%s task_mode=%s codex_cli=%s codex_header=%s client=ccswitch-batch-sender"
+        % (
+            request_count,
+            config["retry_count"],
+            total_cap,
+            task_mode,
+            codex_version.version or "unavailable",
+            "on" if bool(config.get("send_codex_version_header", True)) else "off",
+        )
     )
 
     for round_no in range(1, max_rounds + 1):
@@ -1108,8 +1434,19 @@ def run_batch(
                 if winner is None:
                     winner = item
                     logger.log(
-                        "FIRST_RESULT batch=%s request=%s status=%s latency_ms=%s text=%s"
-                        % (item.round_no, item.index, item.status, item.latency_ms, item.text[:1000])
+                        "FIRST_RESULT batch=%s request=%s status=%s latency_ms=%s prompt=%s text=%s"
+                        % (
+                            item.round_no,
+                            item.index,
+                            item.status,
+                            item.latency_ms,
+                            (
+                                item.request_prompt.replace("\r", " ").replace("\n", " ")[:500]
+                                if request_uses_random_probe(config)
+                                else "<fixed-or-custom>"
+                            ),
+                            item.text[:1000],
+                        )
                     )
                     if on_winner is not None:
                         on_winner(item)
@@ -1244,7 +1581,7 @@ def _show_already_running_message() -> None:
     if os.name == "nt":
         ctypes.windll.user32.MessageBoxW(None, "应用已经在运行。", APP_TITLE, 0x40)
     else:
-        print("应用已经在运行。", file=sys.stderr)
+        _console_print("应用已经在运行。", error=True)
 
 
 def _apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -1255,6 +1592,10 @@ def _apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> di
         updated["retry_count"] = args.retry_count
     if args.message is not None:
         updated["message"] = args.message
+        if args.random_probes is None:
+            updated["random_probe_enabled"] = False
+    if args.random_probes is not None:
+        updated["random_probe_enabled"] = args.random_probes
     return normalize_config(updated)
 
 
@@ -1267,6 +1608,16 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--count", type=int, help="覆盖每批请求次数")
     parser.add_argument("--retry-count", type=int, help="覆盖额外批次重试次数")
     parser.add_argument("--message", help="覆盖提示词")
+    prompt_mode = parser.add_mutually_exclusive_group()
+    prompt_mode.add_argument(
+        "--random-tasks",
+        "--random-probes",
+        dest="random_probes",
+        action="store_true",
+        help="每个请求生成独立随机任务",
+    )
+    prompt_mode.add_argument("--fixed-prompt", dest="random_probes", action="store_false", help="使用固定提示词")
+    parser.set_defaults(random_probes=None)
     parser.add_argument("--output", type=Path, help="成功后将脱敏结果导出到指定 JSON")
     parser.add_argument("--ui-smoke", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -1279,7 +1630,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         if gui_mode:
             _show_already_running_message()
         else:
-            print("应用已经在运行。", file=sys.stderr)
+            _console_print("应用已经在运行。", error=True)
         return 0
     try:
         if gui_mode:
@@ -1291,12 +1642,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         if outcome.winner is not None:
             if args.output:
                 save_result(args.output, outcome.winner, config)
-            print(
+            _console_print(
                 json.dumps(
                     {
                         "ok": True,
                         "round": outcome.winner.round_no,
                         "request_index": outcome.winner.index,
+                        "message": outcome.winner.request_prompt,
                         "text": outcome.winner.text,
                         "output": str(args.output) if args.output else "",
                     },
@@ -1305,10 +1657,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             )
         return outcome.code
     except SenderError as exc:
-        print(f"ERROR {exc}", file=sys.stderr)
+        _console_print(f"ERROR {exc}", error=True)
         return 2
     except KeyboardInterrupt:
-        print("STOPPED", file=sys.stderr)
+        _console_print("STOPPED", error=True)
         return 130
     finally:
         mutex.release()

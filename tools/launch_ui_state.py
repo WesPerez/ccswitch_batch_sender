@@ -20,7 +20,7 @@ def descendants(widget: tk.Misc):
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--view", choices=["default", "advanced", "log"], default="default")
+    parser.add_argument("--view", choices=["default", "advanced", "custom", "log"], default="default")
     args = parser.parse_args()
     enable_dpi_awareness()
     root = tk.Tk()
@@ -29,6 +29,11 @@ def main() -> int:
     notebooks = [widget for widget in descendants(root) if isinstance(widget, ttk.Notebook)]
     if args.view == "advanced" and notebooks:
         notebooks[0].select(1)
+    elif args.view == "custom":
+        app.refresh_preview()
+        app.custom_body_var.set(True)
+        app.toggle_custom_body()
+        app.body_text.see("end")
     elif args.view == "log" and len(notebooks) > 1:
         notebooks[1].select(1)
     root.mainloop()

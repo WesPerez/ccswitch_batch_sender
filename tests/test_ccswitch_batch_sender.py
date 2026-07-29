@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 import ccswitch_batch_sender as sender
 
@@ -86,6 +89,11 @@ class TempCcSwitchDb:
 
 
 class ConfigTests(unittest.TestCase):
+    def test_windowed_logger_tolerates_missing_console_streams(self) -> None:
+        logger = sender.RunLogger()
+        with mock.patch.object(sender.sys, "stdout", None), mock.patch.object(sender.sys, "stderr", None):
+            logger.log("windowed dry run")
+
     def test_zero_request_count_is_rejected_instead_of_replaced(self) -> None:
         with self.assertRaises(sender.SenderError):
             sender.normalize_config({"request_count": 0})
@@ -93,6 +101,17 @@ class ConfigTests(unittest.TestCase):
     def test_retry_count_sets_finite_post_cap(self) -> None:
         config = sender.normalize_config({"request_count": 7, "retry_count": 2})
         self.assertEqual(config["request_count"] * (1 + config["retry_count"]), 21)
+
+    def test_default_uses_random_real_probes(self) -> None:
+        config = sender.normalize_config()
+        self.assertTrue(config["random_probe_enabled"])
+        self.assertGreaterEqual(config["max_output_tokens"], 32)
+
+    def test_v1_saved_defaults_are_migrated_for_real_probes(self) -> None:
+        migrated = sender.migrate_saved_config({"message": "1", "max_output_tokens": 1}, 1)
+        self.assertTrue(migrated["random_probe_enabled"])
+        self.assertEqual(migrated["message"], sender.DEFAULT_FIXED_MESSAGE)
+        self.assertEqual(migrated["max_output_tokens"], sender.DEFAULT_CONFIG["max_output_tokens"])
 
     def test_custom_body_can_replace_the_prompt(self) -> None:
         config = sender.normalize_config(
@@ -182,12 +201,20 @@ class ProtocolTests(unittest.TestCase):
         )
 
     def test_response_body_shape_and_preview_cache_key(self) -> None:
-        config = sender.normalize_config({"message": "probe", "max_output_tokens": 3})
+        config = sender.normalize_config(
+            {"message": "probe", "random_probe_enabled": False, "max_output_tokens": 3}
+        )
         body = sender.build_preview_body(self.provider, config)
         self.assertEqual(body["model"], "gpt-test")
         self.assertEqual(body["input"][0]["content"][0]["text"], "probe")
-        self.assertEqual(body["prompt_cache_key"], "<每个请求唯一>")
+        self.assertNotIn("instructions", body)
+        self.assertEqual(body["prompt_cache_key"], sender.PROMPT_CACHE_KEY_PLACEHOLDER)
         self.assertEqual(body["max_output_tokens"], 3)
+
+    def test_random_preview_uses_readable_placeholders(self) -> None:
+        body = sender.build_preview_body(self.provider, sender.normalize_config())
+        self.assertEqual(body["input"][0]["content"][0]["text"], sender.RANDOM_PROBE_PLACEHOLDER)
+        self.assertEqual(body["prompt_cache_key"], sender.PROMPT_CACHE_KEY_PLACEHOLDER)
 
     def test_custom_body_is_copied_exactly(self) -> None:
         config = sender.normalize_config(
@@ -199,6 +226,132 @@ class ProtocolTests(unittest.TestCase):
         body = sender.build_body(self.provider, config)
         body["model"] = "changed"
         self.assertEqual(config["custom_body"]["model"], "custom")
+
+    def test_custom_body_replaces_exact_placeholders_per_request(self) -> None:
+        template = {
+            "model": "custom",
+            "input": [{"role": "user", "content": sender.RANDOM_PROBE_PLACEHOLDER}],
+            "prompt_cache_key": sender.PROMPT_CACHE_KEY_PLACEHOLDER,
+        }
+        config = sender.normalize_config({"custom_body_enabled": True, "custom_body": template})
+        body = sender.build_body(
+            self.provider,
+            config,
+            cache_key="cache-123",
+            request_prompt="自然任务",
+        )
+        self.assertEqual(body["input"][0]["content"], "自然任务")
+        self.assertEqual(body["prompt_cache_key"], "cache-123")
+        self.assertEqual(config["custom_body"], template)
+
+    def test_legacy_random_probe_placeholder_still_works(self) -> None:
+        config = sender.normalize_config(
+            {
+                "custom_body_enabled": True,
+                "custom_body": {"input": sender.LEGACY_RANDOM_PROBE_PLACEHOLDER},
+            }
+        )
+        body = sender.build_body(self.provider, config, request_prompt="兼容任务")
+        self.assertEqual(body["input"], "兼容任务")
+
+    def test_custom_preview_keeps_cache_placeholder_readable(self) -> None:
+        config = sender.normalize_config(
+            {
+                "custom_body_enabled": True,
+                "unique_prompt_cache_key": False,
+                "custom_body": {"model": "custom", "prompt_cache_key": sender.PROMPT_CACHE_KEY_PLACEHOLDER},
+            }
+        )
+        preview = sender.build_preview_body(self.provider, config)
+        self.assertEqual(preview["prompt_cache_key"], sender.PROMPT_CACHE_KEY_PLACEHOLDER)
+
+    def test_custom_body_preserves_explicit_cache_key(self) -> None:
+        config = sender.normalize_config(
+            {
+                "custom_body_enabled": True,
+                "custom_body": {"model": "custom", "input": "x", "prompt_cache_key": "fixed-key"},
+            }
+        )
+        body = sender.build_body(self.provider, config, cache_key="replacement")
+        self.assertEqual(body["prompt_cache_key"], "fixed-key")
+
+    def test_placeholders_require_an_exact_json_string_value(self) -> None:
+        prompt_value = f"前缀 {sender.RANDOM_TASK_PLACEHOLDER}"
+        cache_value = f"前缀 {sender.PROMPT_CACHE_KEY_PLACEHOLDER}"
+        config = sender.normalize_config(
+            {
+                "custom_body_enabled": True,
+                "custom_body": {"input": prompt_value, "prompt_cache_key": cache_value},
+            }
+        )
+        body = sender.build_body(self.provider, config, cache_key="replacement", request_prompt="替换任务")
+        self.assertEqual(body["input"], prompt_value)
+        self.assertEqual(body["prompt_cache_key"], cache_value)
+
+    def test_each_prepared_request_gets_its_own_prompt_and_cache_key(self) -> None:
+        probes = [
+            sender.ProbeCase(prompt="任务 A", expected={"value": 1}),
+            sender.ProbeCase(prompt="任务 B", expected={"value": 2}),
+        ]
+        config = sender.normalize_config()
+        with mock.patch.object(sender, "generate_probe_case", side_effect=probes), mock.patch.object(
+            sender.uuid,
+            "uuid4",
+            side_effect=["cache-a", "cache-b"],
+        ):
+            first_body, first_prompt, _ = sender.prepare_request_body(self.provider, config)
+            second_body, second_prompt, _ = sender.prepare_request_body(self.provider, config)
+        self.assertEqual((first_prompt, second_prompt), ("任务 A", "任务 B"))
+        self.assertEqual(first_body["prompt_cache_key"], "cache-a")
+        self.assertEqual(second_body["prompt_cache_key"], "cache-b")
+
+    def test_probe_generation_and_semantic_validation(self) -> None:
+        probe = sender.generate_probe_case(random.Random(7))
+        valid, reason = sender.validate_probe_response(json.dumps(probe.expected), probe)
+        self.assertTrue(valid, reason)
+        invalid, _ = sender.validate_probe_response("{}", probe)
+        self.assertFalse(invalid)
+
+    def test_request_headers_report_codex_version_without_impersonating_codex(self) -> None:
+        headers = sender.build_request_headers(
+            self.provider,
+            sender.normalize_config(),
+            codex_version=sender.CodexCliVersion(version="0.144.5", source="test"),
+        )
+        self.assertEqual(headers[sender.CODEX_VERSION_HEADER], "0.144.5")
+        self.assertIn("non-codex", headers["User-Agent"])
+        self.assertNotIn("codex_cli_rs", json.dumps(headers))
+
+    def test_codex_version_header_can_be_disabled(self) -> None:
+        config = sender.normalize_config({"send_codex_version_header": False})
+        headers = sender.build_request_headers(
+            self.provider,
+            config,
+            codex_version=sender.CodexCliVersion(version="0.144.5", source="test"),
+        )
+        self.assertNotIn(sender.CODEX_VERSION_HEADER, headers)
+
+    def test_send_one_rejects_semantically_wrong_probe_response(self) -> None:
+        probe = sender.ProbeCase(prompt="自然任务", expected={"sum": 9, "parity": "odd"})
+        config = sender.normalize_config({"random_probe_enabled": True})
+        with mock.patch.object(sender, "generate_probe_case", return_value=probe), mock.patch.object(
+            sender,
+            "_http_request",
+            return_value=(200, {"output_text": '{"sum":8,"parity":"even"}'}, {}, ""),
+        ):
+            result = sender.send_one(
+                1,
+                self.provider,
+                config,
+                time.monotonic() + 5,
+                sender.RunLogger(callback=lambda _line: None),
+            )
+        self.assertFalse(result.ok)
+        self.assertIn("语义校验失败", result.error)
+        self.assertEqual(result.request_prompt, "自然任务")
+
+    def test_codex_version_parser_accepts_cli_output(self) -> None:
+        self.assertEqual(sender.parse_codex_cli_version("codex-cli 0.144.5"), "0.144.5")
 
     def test_endpoint_candidates_keep_existing_fallback_order(self) -> None:
         self.assertEqual(
@@ -296,18 +449,26 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(calls, 2)
 
     def test_dry_run_never_calls_sender(self) -> None:
+        lines: list[str] = []
+
         def fail_sender(*args, **kwargs):
             raise AssertionError("sender must not be called")
 
         outcome = sender.run_batch(
             sender.normalize_config({"request_count": 2, "retry_count": 2}),
-            sender.RunLogger(callback=lambda _line: None),
+            sender.RunLogger(callback=lines.append),
             dry_run=True,
             provider_loader=lambda _config: self.provider,
             sender=fail_sender,
         )
         self.assertEqual(outcome.code, 0)
         self.assertEqual(outcome.launched, 0)
+        run_start = next(line for line in lines if "RUN_START" in line)
+        self.assertIn("task_mode=random", run_start)
+        self.assertIn("codex_header=on", run_start)
+        self.assertIn("client=ccswitch-batch-sender", run_start)
+        self.assertNotIn("third-party", run_start)
+        self.assertNotIn("random-probe", run_start)
 
 
 if __name__ == "__main__":
