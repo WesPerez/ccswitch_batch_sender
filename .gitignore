@@ -1,8 +1,13 @@
 __pycache__/
 *.py[cod]
 .venv/
+.pytest_cache/
 
 logs/
 latest-result.json
 run.lock
 *.tmp
+
+build/
+dist/
+artifacts/

@@ -1,64 +1,92 @@
-# CCSWITCH Batch Sender
+# CC Switch Batch Sender
 
-这是一个独立于 Codex Desktop 会话的本地脚本：它只读本机
-`%USERPROFILE%\.cc-switch\cc-switch.db`，读取当前 CCSWITCH Codex provider，
-并发发送 20 个最小请求（默认消息为 `1`）。首个成功响应会立即写入
-`latest-result.json` 并显示在界面中；其余 19 个连接继续等待，让 Sub2API 完成账号内重试、
-池模式和换号。默认只发这一批 20 个，不增加客户端重试。
+一个面向 Windows 的轻量批量请求工具。应用只读本机 CC Switch 的 Codex provider，默认跟随 CC Switch 当前上游，也可以在本次运行中选择其他 provider。
+
+## 界面能力
+
+- 默认选中 CC Switch 当前 Codex provider；刷新后重新读取当前指针和 provider 列表。
+- 下拉切换只影响本工具本次发送，不写回 CC Switch，不修改 `cc-switch.db`。
+- 可编辑提示词、每批请求次数、额外批次重试次数、重试间隔、模型/地址覆盖、超时、Endpoint 模式和输出 token。
+- 自动展示实际 JSON 请求体，也可切换为自定义 JSON 后直接编辑。
+- 展示发送上限、批次进度、完成/失败数、首个成功响应、耗时和完整运行日志。
+- 默认不生成 `config.json`、日志文件、结果文件或锁文件。结果和日志只在应用内保留，需要时由用户显式导出。
+- 默认设置保存在当前用户注册表 `HKCU\Software\CCSwitchBatchSender`，不保存 API Key。
+- 使用 Windows 命名互斥体防止重复启动，不产生 `run.lock`。
+
+## 重试语义
+
+“请求次数”是每批并发 POST 数；“重试次数”是首批全部失败后额外发送的批次数，不是对每个请求再次重试。
+
+最大客户端 POST 数：
+
+```text
+请求次数 × (1 + 重试次数)
+```
+
+默认请求次数为 20，重试次数为 0，所以默认上限仍是 20 个 POST。任意请求成功后不会再开启下一批；已经发送的同批请求会继续收尾，以保留原工具面向 Sub2API 池内重试/换号的行为。
 
 ## 运行
 
-双击 `run_ccswitch_batch_sender.bat` 即可。界面打开后会自动发送 20 个请求，
-不需要修改配置，也不需要再点“开始”。界面会显示首个返回结果，并提供“打开结果”和“打开日志”按钮。
+正式交付直接双击：
 
-也可以在 PowerShell 中运行：
+```text
+dist\CCSwitchBatchSender.exe
+```
+
+也可以双击 `run_ccswitch_batch_sender.bat`。脚本会优先启动 EXE；没有 EXE 时回退到本机 Python。
+
+源码运行：
 
 ```powershell
 python .\ccswitch_batch_sender.py --gui
 ```
 
-无界面命令行模式：
-
-```powershell
-python .\ccswitch_batch_sender.py
-```
-
-只检查当前 provider、URL 和模型，不发送请求：
+只读检查当前 provider，不发送请求：
 
 ```powershell
 python .\ccswitch_batch_sender.py --dry-run
 ```
 
-需要一直等待到成功时：
+无界面发送，并覆盖请求次数、额外重试次数和提示词：
 
 ```powershell
-python .\ccswitch_batch_sender.py --until-success
+python .\ccswitch_batch_sender.py --headless --count 20 --retry-count 2 --message "1"
 ```
 
-## 配置
+成功后显式导出结果：
 
-`config.json` 中的 `provider_id: "current"` 会在每一轮读取 CCSWITCH 当前 Codex provider，
-因此切换 CCSWITCH 当前 provider 后，下一轮会自动使用新配置。脚本不保存、不复制 API key。
+```powershell
+python .\ccswitch_batch_sender.py --headless --output .\result.json
+```
 
-- `request_count`：每轮并发请求数，默认 20。
-- `message`：请求内容，默认 `1`。
-- `model` / `base_url`：留空表示读取当前 provider；填值时覆盖 provider 配置。
-- `max_output_tokens`：最大输出 token，默认 1。
-- `request_timeout_seconds`：单个 HTTP 请求默认等待 7200 秒（2 小时）。
-- `max_wait_seconds`：整批默认最多等待 7200 秒（2 小时）。
-- `retry_interval_seconds`：整轮无成功时，下一轮开始前的等待时间。
-- `poll_interval_seconds`：provider 返回异步任务时的轮询间隔。
-- `retry_batches`：默认 `false`，避免一次运行意外发送超过 20 个请求。
-- `endpoint_style`：`auto` 会按 CCSWITCH 常见路径和 OpenAI `/v1` 路径依次尝试。
-- `unique_prompt_cache_key`：为 20 个请求生成不同的缓存键；用户消息仍为 `1`。
-- `db_path`：留空表示使用 `%USERPROFILE%\\.cc-switch\\cc-switch.db`。
+`--config path.json` 仅作为临时高级入口保留，默认运行不依赖任何配置文件。
 
-## 输出与安全
+## 构建单文件 EXE
 
-- 日志：`logs\\run-YYYYMMDD.log`
-- 首个成功结果：`latest-result.json`
-- `run.lock` 防止同一时间启动第二批。
-- 日志和结果不会写入 API key，也不会创建 Codex Desktop 会话。
-- 请求使用真实客户端标识 `CCSWITCH Batch Sender/1.0`；没有伪装成 Codex Desktop。
+环境要求：Python 3.10+、Tk 8.6、PyInstaller 6.14+、Pillow（仅用于生成图标，不打入应用）。构建脚本会自动选择本机已具备这些模块的 Python。
 
-如果 CCSWITCH 数据库不存在、provider 没有 API key/base URL/model，脚本会停止并在日志中给出原因。
+缺少构建依赖时可先执行：
+
+```powershell
+python -m pip install -r .\requirements-build.txt
+```
+
+```powershell
+.\build_single_exe.ps1
+```
+
+构建会先生成 Lucide 风格图标并运行离线测试，再产出：
+
+```text
+dist\CCSwitchBatchSender.exe
+```
+
+发布目录只需要这个 EXE。应用不使用 UPX，减少杀软误报；首次启动的 onefile 解压耗时属于 PyInstaller 正常行为。
+
+## 安全边界
+
+- 以 SQLite `mode=ro` 和 `PRAGMA query_only=ON` 只读打开 `%USERPROFILE%\.cc-switch\cc-switch.db`。
+- 当前 provider 优先读取 `%USERPROFILE%\.cc-switch\settings.json` 的 `currentProviderCodex`，无有效指针时才回退到数据库唯一的 `is_current=1`。
+- 不显示、不复制、不记录 API Key；注册表设置也不包含 Key。
+- provider 下拉只选择本工具的请求来源，不执行 CC Switch 的正式切换操作。
+- 自定义请求体和完整响应导出由用户显式启用；默认结果只包含脱敏 Endpoint、状态、耗时、文本和 usage。

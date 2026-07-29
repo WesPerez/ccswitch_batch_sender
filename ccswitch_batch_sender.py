@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import ctypes
 import datetime as dt
 import json
-import msvcrt
 import os
 import queue
 import re
@@ -20,12 +21,15 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
+APP_NAME = "CC Switch Batch Sender"
+APP_TITLE = "CC Switch 批量请求"
+APP_VERSION = "2.0.0"
 ROOT = Path(__file__).resolve().parent
-DEFAULT_CONFIG_PATH = ROOT / "config.json"
-DEFAULT_LOG_DIR = ROOT / "logs"
-DEFAULT_RESULT_PATH = ROOT / "latest-result.json"
-DEFAULT_LOCK_PATH = ROOT / "run.lock"
 DEFAULT_DB_PATH = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".cc-switch" / "cc-switch.db"
+REGISTRY_PATH = r"Software\CCSwitchBatchSender"
+REGISTRY_VALUE = "SettingsJson"
+REGISTRY_SCHEMA_VALUE = "SchemaVersion"
+MUTEX_NAME = r"Local\CCSwitchBatchSender.App"
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -34,19 +38,39 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "base_url": "",
     "message": "1",
     "request_count": 20,
+    "retry_count": 0,
     "max_output_tokens": 1,
     "request_timeout_seconds": 7200,
     "max_wait_seconds": 7200,
     "retry_interval_seconds": 3,
     "poll_interval_seconds": 2,
-    "retry_batches": False,
-    "user_agent": "CCSWITCH Batch Sender/1.0",
-    "originator": "CCSWITCH Batch Sender",
+    "user_agent": f"{APP_NAME}/{APP_VERSION}",
+    "originator": APP_NAME,
     "db_path": "",
     "endpoint_style": "auto",
     "unique_prompt_cache_key": True,
     "save_full_response": False,
+    "custom_body_enabled": False,
+    "custom_body": None,
 }
+
+PERSISTED_KEYS = (
+    "model",
+    "base_url",
+    "message",
+    "request_count",
+    "retry_count",
+    "max_output_tokens",
+    "request_timeout_seconds",
+    "max_wait_seconds",
+    "retry_interval_seconds",
+    "poll_interval_seconds",
+    "endpoint_style",
+    "unique_prompt_cache_key",
+    "save_full_response",
+    "custom_body_enabled",
+    "custom_body",
+)
 
 
 class SenderError(RuntimeError):
@@ -63,10 +87,30 @@ class Provider:
     api_format: str
 
 
+@dataclass(frozen=True)
+class ProviderSummary:
+    provider_id: str
+    name: str
+    is_current: bool
+    model: str
+    base_url: str
+    api_format: str
+    has_api_key: bool
+    available: bool
+    unavailable_reason: str = ""
+
+
+@dataclass(frozen=True)
+class ProviderCatalog:
+    current_provider_id: str
+    providers: tuple[ProviderSummary, ...]
+
+
 @dataclass
 class AttemptResult:
     index: int
     ok: bool
+    round_no: int = 1
     status: int | None = None
     text: str = ""
     error: str = ""
@@ -78,105 +122,227 @@ class AttemptResult:
     response_headers: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ProgressEvent:
+    kind: str
+    round_no: int = 0
+    max_rounds: int = 0
+    request_index: int | None = None
+    launched_total: int = 0
+    completed_total: int = 0
+    failed_total: int = 0
+    total_cap: int = 0
+    completed_in_round: int = 0
+    round_size: int = 0
+    winner: AttemptResult | None = None
+    message: str = ""
+    unfinished: int = 0
+
+
+@dataclass(frozen=True)
+class RunOutcome:
+    code: int
+    winner: AttemptResult | None
+    launched: int
+    completed: int
+    failed: int
+    unfinished: int = 0
+
+
 class RunLogger:
-    def __init__(self, log_dir: Path, callback: Callable[[str], None] | None = None) -> None:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        self.path = log_dir / f"run-{dt.datetime.now():%Y%m%d}.log"
+    def __init__(
+        self,
+        callback: Callable[[str], None] | None = None,
+        path: Path | None = None,
+    ) -> None:
+        self.path = path
         self._callback = callback
         self._lock = threading.Lock()
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def log(self, message: str) -> None:
         stamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
         line = f"[{stamp}] {message}"
         with self._lock:
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
+            if self.path is not None:
+                with self.path.open("a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
         if self._callback is not None:
             self._callback(line)
-        else:
+        elif self.path is None:
             print(line, flush=True)
 
 
-class SingleRunLock:
-    """Windows-compatible single-instance lock, adapted from the reference task."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.handle = None
+class SingleInstanceMutex:
+    def __init__(self, name: str = MUTEX_NAME) -> None:
+        self.name = name
+        self.handle: int | None = None
 
     def acquire(self) -> bool:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        handle = self.path.open("a+b")
-        try:
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write(b"0")
-                handle.flush()
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            self.handle = handle
+        if os.name != "nt":
             return True
-        except OSError:
-            handle.close()
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.SetLastError(0)
+        handle = kernel32.CreateMutexW(None, False, self.name)
+        if not handle:
+            raise ctypes.WinError()
+        if kernel32.GetLastError() == 183:
+            kernel32.CloseHandle(handle)
             return False
+        self.handle = int(handle)
+        return True
 
     def release(self) -> None:
-        if self.handle is None:
+        if self.handle is None or os.name != "nt":
             return
+        ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(self.handle))
+        self.handle = None
+
+
+def enable_dpi_awareness() -> None:
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except (AttributeError, OSError):
         try:
-            self.handle.seek(0)
-            msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
-        except OSError:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except (AttributeError, OSError):
             pass
-        finally:
-            self.handle.close()
-            self.handle = None
+
+
+def resource_path(relative: str | Path) -> Path:
+    base = Path(getattr(sys, "_MEIPASS", ROOT))
+    return base / Path(relative)
+
+
+def _coerce_int(value: Any, field_name: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise SenderError(f"{field_name} 必须是整数。") from exc
+
+
+def _coerce_float(value: Any, field_name: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise SenderError(f"{field_name} 必须是数字。") from exc
+
+
+def normalize_config(values: dict[str, Any] | None = None) -> dict[str, Any]:
+    raw = dict(DEFAULT_CONFIG)
+    if values:
+        raw.update(values)
+
+    config: dict[str, Any] = {
+        "provider_id": str(raw.get("provider_id", "current")).strip() or "current",
+        "model": str(raw.get("model", "")).strip(),
+        "base_url": str(raw.get("base_url", "")).strip().rstrip("/"),
+        "message": str(raw.get("message", "")),
+        "request_count": _coerce_int(raw.get("request_count"), "请求次数"),
+        "retry_count": _coerce_int(raw.get("retry_count"), "重试次数"),
+        "max_output_tokens": _coerce_int(raw.get("max_output_tokens"), "最大输出 token"),
+        "request_timeout_seconds": _coerce_float(raw.get("request_timeout_seconds"), "单次超时"),
+        "max_wait_seconds": _coerce_float(raw.get("max_wait_seconds"), "总等待时间"),
+        "retry_interval_seconds": _coerce_float(raw.get("retry_interval_seconds"), "重试间隔"),
+        "poll_interval_seconds": _coerce_float(raw.get("poll_interval_seconds"), "轮询间隔"),
+        "user_agent": str(raw.get("user_agent", DEFAULT_CONFIG["user_agent"])).strip(),
+        "originator": str(raw.get("originator", DEFAULT_CONFIG["originator"])).strip(),
+        "db_path": str(raw.get("db_path", "")).strip(),
+        "endpoint_style": str(raw.get("endpoint_style", "auto")).strip().lower(),
+        "unique_prompt_cache_key": bool(raw.get("unique_prompt_cache_key", True)),
+        "save_full_response": bool(raw.get("save_full_response", False)),
+        "custom_body_enabled": bool(raw.get("custom_body_enabled", False)),
+        "custom_body": copy.deepcopy(raw.get("custom_body")),
+    }
+
+    if not 1 <= config["request_count"] <= 100:
+        raise SenderError("请求次数必须在 1 到 100 之间。")
+    if not 0 <= config["retry_count"] <= 10:
+        raise SenderError("重试次数必须在 0 到 10 之间。")
+    if not 1 <= config["max_output_tokens"] <= 4096:
+        raise SenderError("最大输出 token 必须在 1 到 4096 之间。")
+    if config["request_timeout_seconds"] <= 0:
+        raise SenderError("单次超时必须大于 0。")
+    if config["max_wait_seconds"] < 0:
+        raise SenderError("总等待时间不能小于 0。")
+    if config["retry_interval_seconds"] < 0:
+        raise SenderError("重试间隔不能小于 0。")
+    if config["poll_interval_seconds"] <= 0:
+        raise SenderError("轮询间隔必须大于 0。")
+    if config["endpoint_style"] not in {"auto", "ccswitch", "openai"}:
+        raise SenderError("Endpoint 模式只能是 auto、ccswitch 或 openai。")
+
+    custom_body = config["custom_body"]
+    if isinstance(custom_body, str):
+        try:
+            custom_body = json.loads(custom_body)
+        except json.JSONDecodeError as exc:
+            raise SenderError(f"自定义请求体不是有效 JSON：{exc.msg}。") from exc
+        config["custom_body"] = custom_body
+    if config["custom_body_enabled"]:
+        if not isinstance(custom_body, dict):
+            raise SenderError("自定义请求体必须是 JSON 对象。")
+    elif not config["message"].strip():
+        raise SenderError("提示词不能为空。")
+    elif custom_body is not None and not isinstance(custom_body, dict):
+        config["custom_body"] = None
+    return config
 
 
 def load_json_config(path: Path) -> dict[str, Any]:
-    config = dict(DEFAULT_CONFIG)
-    if path.exists():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise SenderError(f"配置文件不是有效 JSON：{path}: {exc}") from exc
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise SenderError(f"配置文件不存在：{path}") from exc
+    except json.JSONDecodeError as exc:
+        raise SenderError(f"配置文件不是有效 JSON：{path}: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise SenderError(f"配置文件必须是 JSON 对象：{path}")
+    return normalize_config(loaded)
+
+
+def load_saved_config() -> dict[str, Any]:
+    if os.name != "nt":
+        return normalize_config()
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REGISTRY_PATH) as key:
+            raw, _ = winreg.QueryValueEx(key, REGISTRY_VALUE)
+        loaded = json.loads(str(raw))
         if not isinstance(loaded, dict):
-            raise SenderError(f"配置文件必须是 JSON 对象：{path}")
-        config.update(loaded)
+            return normalize_config()
+        return normalize_config(loaded)
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError, SenderError):
+        return normalize_config()
 
-    config["provider_id"] = str(config.get("provider_id") or "current").strip()
-    config["model"] = str(config.get("model") or "").strip()
-    config["base_url"] = str(config.get("base_url") or "").strip().rstrip("/")
-    config["message"] = str(config.get("message") or "")
-    config["request_count"] = int(config.get("request_count") or 20)
-    config["max_output_tokens"] = int(config.get("max_output_tokens") or 1)
-    config["request_timeout_seconds"] = float(config.get("request_timeout_seconds") or 7200)
-    config["max_wait_seconds"] = float(config.get("max_wait_seconds") or 7200)
-    config["retry_interval_seconds"] = float(config.get("retry_interval_seconds") or 3)
-    config["poll_interval_seconds"] = float(config.get("poll_interval_seconds") or 2)
-    config["retry_batches"] = bool(config.get("retry_batches", False))
-    config["user_agent"] = str(config.get("user_agent") or DEFAULT_CONFIG["user_agent"]).strip()
-    config["originator"] = str(config.get("originator") or DEFAULT_CONFIG["originator"]).strip()
-    config["endpoint_style"] = str(config.get("endpoint_style") or "auto").strip().lower()
-    config["unique_prompt_cache_key"] = bool(config.get("unique_prompt_cache_key", True))
-    config["db_path"] = str(config.get("db_path") or "").strip()
-    config["save_full_response"] = bool(config.get("save_full_response", False))
 
-    if not 1 <= config["request_count"] <= 100:
-        raise SenderError("request_count 必须在 1 到 100 之间。")
-    if not 1 <= config["max_output_tokens"] <= 64:
-        raise SenderError("max_output_tokens 必须在 1 到 64 之间。")
-    if config["request_timeout_seconds"] <= 0:
-        raise SenderError("request_timeout_seconds 必须大于 0。")
-    if config["max_wait_seconds"] < 0:
-        raise SenderError("max_wait_seconds 不能小于 0；设为 0 表示仅由 --until-success 无限等待。")
-    if config["retry_interval_seconds"] < 0 or config["poll_interval_seconds"] <= 0:
-        raise SenderError("retry_interval_seconds 不能小于 0，poll_interval_seconds 必须大于 0。")
-    if not config["message"]:
-        raise SenderError("message 不能为空。")
-    if config["endpoint_style"] not in {"auto", "ccswitch", "openai"}:
-        raise SenderError("endpoint_style 只能是 auto、ccswitch 或 openai。")
-    return config
+def persistent_config_payload(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalize_config(config)
+    return {key: copy.deepcopy(normalized[key]) for key in PERSISTED_KEYS}
+
+
+def save_saved_config(config: dict[str, Any]) -> None:
+    if os.name != "nt":
+        return
+    import winreg
+
+    payload = persistent_config_payload(config)
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, REGISTRY_PATH, 0, winreg.KEY_WRITE) as key:
+        winreg.SetValueEx(key, REGISTRY_SCHEMA_VALUE, 0, winreg.REG_DWORD, 1)
+        winreg.SetValueEx(
+            key,
+            REGISTRY_VALUE,
+            0,
+            winreg.REG_SZ,
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        )
 
 
 def parse_assignment(text: str, key: str) -> str:
@@ -197,84 +363,207 @@ def _config_value(config_obj: Any, key: str) -> str:
     return parse_assignment(str(config_obj or ""), key)
 
 
-def resolve_db_path(config: dict[str, Any]) -> Path:
-    value = str(config.get("db_path") or "").strip()
+def resolve_db_path(config: dict[str, Any] | None = None) -> Path:
+    value = str((config or {}).get("db_path") or "").strip()
     if not value:
         return DEFAULT_DB_PATH
     return Path(os.path.expandvars(value)).expanduser()
 
 
-def load_provider(config: dict[str, Any]) -> Provider:
-    db_path = resolve_db_path(config)
+def _settings_path_for_db(db_path: Path) -> Path:
+    return db_path.with_name("settings.json")
+
+
+def _connect_readonly(db_path: Path) -> sqlite3.Connection:
     if not db_path.exists():
         raise SenderError(
-            f"CCSWITCH 数据库不存在：{db_path}\n"
-            "请先安装并配置 CCSWITCH，脚本不会自行创建或复制 API key。"
+            f"CC Switch 数据库不存在：{db_path}\n"
+            "请先安装并配置 CC Switch；本工具不会创建数据库或复制 API Key。"
         )
-
-    provider_id = str(config["provider_id"])
     try:
-        connection = sqlite3.connect(str(db_path), timeout=3)
+        connection = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
     except sqlite3.Error as exc:
-        raise SenderError(f"无法只读打开 CCSWITCH 数据库：{exc}") from exc
+        raise SenderError(f"无法只读打开 CC Switch 数据库：{exc}") from exc
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only = ON")
+    return connection
+
+
+def _settings_current_provider_id(settings_path: Path) -> str:
     try:
-        connection.execute("PRAGMA query_only = ON")
-        if provider_id.lower() == "current":
-            row = connection.execute(
-                """
-                SELECT id, name, settings_config, meta
-                FROM providers
-                WHERE app_type = 'codex' AND is_current = 1
-                ORDER BY sort_index, id
-                LIMIT 1
-                """
-            ).fetchone()
-        else:
-            row = connection.execute(
-                """
-                SELECT id, name, settings_config, meta
-                FROM providers
-                WHERE app_type = 'codex' AND id = ?
-                LIMIT 1
-                """,
-                (provider_id,),
-            ).fetchone()
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("currentProviderCodex") or "").strip()
+
+
+def _resolve_current_provider_id(
+    connection: sqlite3.Connection,
+    settings_path: Path,
+    *,
+    strict: bool,
+) -> str:
+    pointer = _settings_current_provider_id(settings_path)
+    if pointer:
+        row = connection.execute(
+            "SELECT id FROM providers WHERE app_type = 'codex' AND id = ? LIMIT 1",
+            (pointer,),
+        ).fetchone()
+        if row is not None:
+            return str(row["id"])
+
+    rows = connection.execute(
+        """
+        SELECT id
+        FROM providers
+        WHERE app_type = 'codex' AND is_current = 1
+        ORDER BY sort_index, id
+        LIMIT 2
+        """
+    ).fetchall()
+    if len(rows) == 1:
+        return str(rows[0]["id"])
+    if not strict:
+        return ""
+    if len(rows) > 1:
+        raise SenderError("CC Switch 中存在多个当前 Codex provider，无法安全判断。")
+    raise SenderError("CC Switch 没有可识别的当前 Codex provider。")
+
+
+def _decode_provider_row(row: sqlite3.Row) -> tuple[dict[str, Any], dict[str, Any], Any]:
+    try:
+        settings = json.loads(row["settings_config"] or "{}")
+        meta = json.loads(row["meta"] or "{}")
+    except json.JSONDecodeError as exc:
+        raise SenderError(f"provider 配置 JSON 无法解析：{row['name']}") from exc
+    settings = settings if isinstance(settings, dict) else {}
+    meta = meta if isinstance(meta, dict) else {}
+    config_blob = settings.get("config", "")
+    return settings, meta, config_blob
+
+
+def _infer_api_format(meta: dict[str, Any], config_blob: Any) -> str:
+    api_format = str(meta.get("apiFormat") or "").strip().lower()
+    if api_format in {"openai_chat", "openai_responses"}:
+        return api_format
+    wire_api = _config_value(config_blob, "wire_api").lower()
+    if wire_api == "responses":
+        return "openai_responses"
+    if wire_api in {"chat", "chat_completions"}:
+        return "openai_chat"
+    return ""
+
+
+def list_codex_providers(config: dict[str, Any] | None = None) -> ProviderCatalog:
+    db_path = resolve_db_path(config)
+    connection = _connect_readonly(db_path)
+    try:
+        current_id = _resolve_current_provider_id(connection, _settings_path_for_db(db_path), strict=False)
+        rows = connection.execute(
+            """
+            SELECT id, name, settings_config, meta, is_current, sort_index
+            FROM providers
+            WHERE app_type = 'codex'
+            ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END, sort_index, id
+            LIMIT 100
+            """,
+            (current_id,),
+        ).fetchall()
+        providers: list[ProviderSummary] = []
+        for row in rows:
+            name = str(row["name"] or row["id"])
+            try:
+                settings, meta, config_blob = _decode_provider_row(row)
+                auth = settings.get("auth") if isinstance(settings, dict) else {}
+                auth = auth if isinstance(auth, dict) else {}
+                has_api_key = bool(str(auth.get("OPENAI_API_KEY") or "").strip())
+                base_url = _config_value(config_blob, "base_url").rstrip("/")
+                model = _config_value(config_blob, "model")
+                api_format = _infer_api_format(meta, config_blob)
+                missing = []
+                if not has_api_key:
+                    missing.append("无 API Key")
+                if not base_url:
+                    missing.append("无地址")
+                if not model:
+                    missing.append("无模型")
+                if not api_format:
+                    missing.append("API 格式未知")
+                providers.append(
+                    ProviderSummary(
+                        provider_id=str(row["id"]),
+                        name=name,
+                        is_current=str(row["id"]) == current_id,
+                        model=model,
+                        base_url=base_url,
+                        api_format=api_format,
+                        has_api_key=has_api_key,
+                        available=not missing,
+                        unavailable_reason="、".join(missing),
+                    )
+                )
+            except SenderError as exc:
+                providers.append(
+                    ProviderSummary(
+                        provider_id=str(row["id"]),
+                        name=name,
+                        is_current=str(row["id"]) == current_id,
+                        model="",
+                        base_url="",
+                        api_format="",
+                        has_api_key=False,
+                        available=False,
+                        unavailable_reason=str(exc),
+                    )
+                )
+        return ProviderCatalog(current_provider_id=current_id, providers=tuple(providers))
+    finally:
+        connection.close()
+
+
+def load_provider(config: dict[str, Any]) -> Provider:
+    db_path = resolve_db_path(config)
+    connection = _connect_readonly(db_path)
+    try:
+        requested_id = str(config.get("provider_id") or "current").strip()
+        provider_id = (
+            _resolve_current_provider_id(connection, _settings_path_for_db(db_path), strict=True)
+            if requested_id.lower() == "current"
+            else requested_id
+        )
+        row = connection.execute(
+            """
+            SELECT id, name, settings_config, meta
+            FROM providers
+            WHERE app_type = 'codex' AND id = ?
+            LIMIT 1
+            """,
+            (provider_id,),
+        ).fetchone()
         if row is None:
-            raise SenderError(f"CCSWITCH Codex provider 不存在：{provider_id}")
+            raise SenderError(f"CC Switch Codex provider 不存在：{provider_id}")
 
-        try:
-            settings = json.loads(row["settings_config"] or "{}")
-            meta = json.loads(row["meta"] or "{}")
-        except json.JSONDecodeError as exc:
-            raise SenderError(f"provider 配置 JSON 无法解析：{row['name']}") from exc
-
+        settings, meta, config_blob = _decode_provider_row(row)
         auth = settings.get("auth") if isinstance(settings, dict) else {}
         auth = auth if isinstance(auth, dict) else {}
         api_key = str(auth.get("OPENAI_API_KEY") or "").strip()
         if not api_key:
             raise SenderError(
-                f"当前 provider 没有 OPENAI_API_KEY：{row['name']}。"
-                "官方 OAuth provider 不能直接按本脚本的 API key 方式发送。"
+                f"provider 没有 OPENAI_API_KEY：{row['name']}。"
+                "官方 OAuth provider 不能按 API Key 方式直接发送。"
             )
 
-        config_blob = settings.get("config", "") if isinstance(settings, dict) else ""
-        configured_base = str(config.get("base_url") or "").strip()
-        configured_model = str(config.get("model") or "").strip()
-        base_url = configured_base or _config_value(config_blob, "base_url")
-        model = configured_model or _config_value(config_blob, "model")
-        api_format = str(meta.get("apiFormat") or "").strip().lower()
-        if api_format not in {"openai_chat", "openai_responses"}:
-            wire_api = _config_value(config_blob, "wire_api").lower()
-            api_format = "openai_responses" if wire_api == "responses" else "openai_chat" if wire_api in {"chat", "chat_completions"} else ""
-
+        base_url = str(config.get("base_url") or "").strip() or _config_value(config_blob, "base_url")
+        model = str(config.get("model") or "").strip() or _config_value(config_blob, "model")
+        api_format = _infer_api_format(meta, config_blob)
         if not base_url:
             raise SenderError(f"provider 没有 base_url：{row['name']}")
         if not model:
             raise SenderError(f"provider 没有 model：{row['name']}")
         if not api_format:
             raise SenderError(f"无法判断 provider 的 API 格式：{row['name']}")
-
         return Provider(
             provider_id=str(row["id"]),
             name=str(row["name"]),
@@ -293,26 +582,39 @@ def endpoint_candidates(provider: Provider, style: str) -> list[str]:
         if base.endswith("/responses"):
             return [base]
         openai_endpoint = base + "/responses" if base.endswith("/v1") else base + "/v1/responses"
-        if style == "openai":
-            candidates = [openai_endpoint]
-        elif style == "ccswitch":
-            candidates = [base + "/responses"]
-        else:
-            candidates = [base + "/responses", openai_endpoint]
+        candidates = (
+            [openai_endpoint]
+            if style == "openai"
+            else [base + "/responses"]
+            if style == "ccswitch"
+            else [base + "/responses", openai_endpoint]
+        )
     else:
         if base.endswith("/chat/completions"):
             return [base]
         openai_endpoint = base + "/chat/completions" if base.endswith("/v1") else base + "/v1/chat/completions"
-        if style == "openai":
-            candidates = [openai_endpoint]
-        elif style == "ccswitch":
-            candidates = [base + "/v1/chat/completions"]
-        else:
-            candidates = [base + "/v1/chat/completions", openai_endpoint]
+        candidates = (
+            [openai_endpoint]
+            if style == "openai"
+            else [base + "/v1/chat/completions"]
+            if style == "ccswitch"
+            else [base + "/v1/chat/completions", openai_endpoint]
+        )
     return list(dict.fromkeys(candidates))
 
 
-def build_body(provider: Provider, config: dict[str, Any]) -> dict[str, Any]:
+def build_body(
+    provider: Provider,
+    config: dict[str, Any],
+    *,
+    cache_key: str | None = None,
+) -> dict[str, Any]:
+    if bool(config.get("custom_body_enabled")):
+        body = config.get("custom_body")
+        if not isinstance(body, dict):
+            raise SenderError("自定义请求体必须是 JSON 对象。")
+        return copy.deepcopy(body)
+
     message = str(config["message"])
     if provider.api_format == "openai_chat":
         return {
@@ -321,7 +623,7 @@ def build_body(provider: Provider, config: dict[str, Any]) -> dict[str, Any]:
             "max_tokens": int(config["max_output_tokens"]),
             "stream": False,
         }
-    body = {
+    body: dict[str, Any] = {
         "model": provider.model,
         "instructions": f"Return {message}.",
         "input": [
@@ -339,8 +641,13 @@ def build_body(provider: Provider, config: dict[str, Any]) -> dict[str, Any]:
         "max_output_tokens": int(config["max_output_tokens"]),
     }
     if bool(config.get("unique_prompt_cache_key", True)):
-        body["prompt_cache_key"] = str(uuid.uuid4())
+        body["prompt_cache_key"] = cache_key or str(uuid.uuid4())
     return body
+
+
+def build_preview_body(provider: Provider, config: dict[str, Any]) -> dict[str, Any]:
+    key = "<每个请求唯一>" if bool(config.get("unique_prompt_cache_key", True)) else None
+    return build_body(provider, config, cache_key=key)
 
 
 def _redact_url(url: str) -> str:
@@ -417,7 +724,6 @@ def _http_request(
         "Accept": "application/json",
         "Content-Type": "application/json",
         "Authorization": "Bearer " + provider.api_key,
-        # This identifies the real sender instead of impersonating Codex Desktop.
         "User-Agent": str(config["user_agent"]),
     }
     if provider.api_format == "openai_responses":
@@ -435,6 +741,13 @@ def _http_request(
         return None, None, {}, str(exc)
 
 
+def _request_timeout(config: dict[str, Any], deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return 0
+    return max(0.1, min(float(config["request_timeout_seconds"]), remaining))
+
+
 def _poll_pending(
     result: AttemptResult,
     provider: Provider,
@@ -449,21 +762,27 @@ def _poll_pending(
     if location:
         poll_url = urllib.parse.urljoin(result.endpoint + "/", location)
     elif request_id and provider.api_format == "openai_responses":
-        # Try the same endpoint family used for the POST.
         poll_url = result.endpoint.rstrip("/") + "/" + urllib.parse.quote(str(request_id), safe="")
     else:
-        return AttemptResult(**{**result.__dict__, "ok": False, "error": "Provider returned an async response without a poll URL."})
+        return AttemptResult(**{**result.__dict__, "ok": False, "error": "异步响应缺少轮询地址。"})
 
     while time.monotonic() < deadline and not (abort_event and abort_event.is_set()):
-        time.sleep(min(float(config["poll_interval_seconds"]), max(0.0, deadline - time.monotonic())))
-        status, body, headers, error = _http_request("GET", poll_url, None, provider, config, float(config["request_timeout_seconds"]))
+        wait_for = min(float(config["poll_interval_seconds"]), max(0.0, deadline - time.monotonic()))
+        if abort_event and abort_event.wait(wait_for):
+            break
+        timeout = _request_timeout(config, deadline)
+        if timeout <= 0:
+            break
+        status, body, headers, error = _http_request("GET", poll_url, None, provider, config, timeout)
         if status is None:
+            logger.log(f"POLL_WAIT round={result.round_no} request={result.index} error={error[:300]}")
             continue
         if 200 <= status < 300 and not _is_pending(body, status):
             text = _extract_text(body)
             if text or isinstance(body, dict):
                 return AttemptResult(
                     index=result.index,
+                    round_no=result.round_no,
                     ok=True,
                     status=status,
                     text=text,
@@ -476,13 +795,14 @@ def _poll_pending(
         if status >= 400:
             return AttemptResult(
                 index=result.index,
+                round_no=result.round_no,
                 ok=False,
                 status=status,
                 error=f"poll HTTP {status}: {str(body)[:500]}",
                 endpoint=poll_url,
                 provider_name=provider.name,
             )
-    reason = "Polling stopped after another request succeeded." if abort_event and abort_event.is_set() else "Polling deadline exceeded."
+    reason = "轮询已停止。" if abort_event and abort_event.is_set() else "轮询超时。"
     return AttemptResult(**{**result.__dict__, "ok": False, "error": reason})
 
 
@@ -493,19 +813,30 @@ def send_one(
     deadline: float,
     logger: RunLogger,
     abort_polling: threading.Event | None = None,
+    *,
+    round_no: int = 1,
 ) -> AttemptResult:
     started = time.monotonic()
     body = build_body(provider, config)
     last_error = ""
+    last_status: int | None = None
+    last_payload: Any = None
+    last_endpoint = ""
     for endpoint in endpoint_candidates(provider, str(config["endpoint_style"])):
-        status, payload, headers, error = _http_request(
-            "POST", endpoint, body, provider, config, float(config["request_timeout_seconds"])
-        )
+        timeout = _request_timeout(config, deadline)
+        if timeout <= 0:
+            last_error = "请求未发送：已到达本轮截止时间。"
+            break
+        last_endpoint = endpoint
+        status, payload, headers, error = _http_request("POST", endpoint, body, provider, config, timeout)
+        last_status = status
+        last_payload = payload
         latency_ms = int((time.monotonic() - started) * 1000)
         if status is not None and 200 <= status < 300:
             if isinstance(payload, dict) and payload.get("error"):
                 return AttemptResult(
                     index=index,
+                    round_no=round_no,
                     ok=False,
                     status=status,
                     error=f"Provider error: {str(payload.get('error'))[:500]}",
@@ -519,6 +850,7 @@ def send_one(
             if state in {"failed", "cancelled", "canceled", "expired"}:
                 return AttemptResult(
                     index=index,
+                    round_no=round_no,
                     ok=False,
                     status=status,
                     error=f"Provider returned terminal status: {state}",
@@ -530,6 +862,7 @@ def send_one(
                 )
             result = AttemptResult(
                 index=index,
+                round_no=round_no,
                 ok=not _is_pending(payload, status),
                 status=status,
                 text=_extract_text(payload),
@@ -544,27 +877,33 @@ def send_one(
                 return _poll_pending(result, provider, config, deadline, logger, abort_polling)
             if result.text or isinstance(payload, dict):
                 return result
-            return AttemptResult(**{**result.__dict__, "ok": False, "error": "HTTP 2xx response contained no usable body."})
+            return AttemptResult(**{**result.__dict__, "ok": False, "error": "HTTP 2xx 响应没有可用内容。"})
 
         last_error = f"HTTP {status}: {str(payload)[:500]}" if status is not None else error
-        # Only try the alternate endpoint when the path itself was not found/method was rejected.
         if status not in {404, 405}:
             break
     return AttemptResult(
         index=index,
+        round_no=round_no,
         ok=False,
-        status=status,
-        error=last_error or "No response",
-        endpoint=endpoint if 'endpoint' in locals() else "",
+        status=last_status,
+        error=last_error or "没有收到响应。",
+        endpoint=last_endpoint,
         latency_ms=int((time.monotonic() - started) * 1000),
+        payload=last_payload,
         provider_name=provider.name,
     )
 
 
-def save_result(path: Path, result: AttemptResult, config: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def build_result_dict(
+    result: AttemptResult,
+    config: dict[str, Any],
+    *,
+    now: dt.datetime | None = None,
+) -> dict[str, Any]:
     data: dict[str, Any] = {
-        "completed_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "completed_at": (now or dt.datetime.now().astimezone()).isoformat(timespec="seconds"),
+        "round": result.round_no,
         "request_index": result.index,
         "provider": result.provider_name,
         "status": result.status,
@@ -579,261 +918,400 @@ def save_result(path: Path, result: AttemptResult, config: dict[str, Any]) -> No
         data["usage"] = result.payload.get("usage") or {}
     if bool(config.get("save_full_response")):
         data["response"] = result.payload
+    return data
+
+
+def save_result(path: Path, result: AttemptResult, config: dict[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(
+        json.dumps(build_result_dict(result, config), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     tmp.replace(path)
+    return path
+
+
+def _emit_progress(callback: Callable[[ProgressEvent], None] | None, **kwargs: Any) -> None:
+    if callback is not None:
+        callback(ProgressEvent(**kwargs))
+
+
+def _all_failures_are_non_retryable(results: list[AttemptResult]) -> bool:
+    if not results:
+        return False
+    statuses = [item.status for item in results]
+    return all(status in {400, 401, 403, 404, 405, 422} for status in statuses if status is not None) and all(
+        status is not None for status in statuses
+    )
 
 
 def run_batch(
     config: dict[str, Any],
     logger: RunLogger,
-    result_path: Path,
     stop_event: threading.Event | None = None,
-    until_success: bool = False,
     dry_run: bool = False,
     on_winner: Callable[[AttemptResult], None] | None = None,
-) -> tuple[int, AttemptResult | None]:
+    on_progress: Callable[[ProgressEvent], None] | None = None,
+    provider_loader: Callable[[dict[str, Any]], Provider] = load_provider,
+    sender: Callable[..., AttemptResult] = send_one,
+) -> RunOutcome:
+    config = normalize_config(config)
     stop_event = stop_event or threading.Event()
     started = time.monotonic()
-    round_no = 0
-    while not stop_event.is_set():
-        round_no += 1
-        provider = load_provider(config)
+    request_count = int(config["request_count"])
+    max_rounds = 1 + int(config["retry_count"])
+    total_cap = request_count * max_rounds
+    max_wait = float(config["max_wait_seconds"])
+    run_deadline = started + max_wait if max_wait > 0 else None
+    launched_total = 0
+    completed_total = 0
+    failed_total = 0
+    winner: AttemptResult | None = None
+    logger.log(
+        "RUN_START count=%s retries=%s post_cap=%s"
+        % (request_count, config["retry_count"], total_cap)
+    )
+
+    for round_no in range(1, max_rounds + 1):
+        if stop_event.is_set():
+            _emit_progress(
+                on_progress,
+                kind="stopped",
+                round_no=round_no,
+                max_rounds=max_rounds,
+                launched_total=launched_total,
+                completed_total=completed_total,
+                failed_total=failed_total,
+                total_cap=total_cap,
+                message="已停止。",
+            )
+            return RunOutcome(130, winner, launched_total, completed_total, failed_total)
+        if run_deadline is not None and time.monotonic() >= run_deadline:
+            logger.log("TIMEOUT reached before starting the next batch")
+            return RunOutcome(1, winner, launched_total, completed_total, failed_total)
+
+        provider = provider_loader(config)
         endpoints = endpoint_candidates(provider, str(config["endpoint_style"]))
         if dry_run:
             logger.log(
-                "DRY_RUN provider=%s model=%s api_format=%s count=%s endpoints=%s"
-                % (provider.name, provider.model, provider.api_format, config["request_count"], [_redact_url(x) for x in endpoints])
+                "DRY_RUN provider=%s model=%s api_format=%s count=%s retries=%s endpoints=%s"
+                % (
+                    provider.name,
+                    provider.model,
+                    provider.api_format,
+                    request_count,
+                    config["retry_count"],
+                    [_redact_url(item) for item in endpoints],
+                )
             )
-            return 0, None
+            _emit_progress(
+                on_progress,
+                kind="dry_run",
+                round_no=round_no,
+                max_rounds=max_rounds,
+                launched_total=0,
+                completed_total=0,
+                failed_total=0,
+                total_cap=total_cap,
+                message=provider.name,
+            )
+            return RunOutcome(0, None, 0, 0, 0)
 
+        now = time.monotonic()
+        round_deadline = run_deadline if run_deadline is not None else now + float(config["request_timeout_seconds"])
         logger.log(
-            "ROUND %s sending=%s provider=%s model=%s api_format=%s"
-            % (round_no, config["request_count"], provider.name, provider.model, provider.api_format)
+            "BATCH_START batch=%s/%s sending=%s provider=%s model=%s api_format=%s"
+            % (round_no, max_rounds, request_count, provider.name, provider.model, provider.api_format)
         )
         result_queue: queue.Queue[AttemptResult] = queue.Queue()
         threads: list[threading.Thread] = []
         abort_polling = threading.Event()
-        if not until_success and float(config["max_wait_seconds"]) > 0:
-            round_deadline = started + float(config["max_wait_seconds"])
-        else:
-            round_deadline = time.monotonic() + float(config["request_timeout_seconds"]) + 5
 
         def worker(number: int) -> None:
             try:
-                # Every worker always performs its initial POST. abort_polling only stops
-                # follow-up polling after another worker has already won.
-                result_queue.put(send_one(number, provider, config, round_deadline, logger, abort_polling))
-            except Exception as exc:  # defensive: one worker must not kill the whole batch
-                result_queue.put(AttemptResult(index=number, ok=False, error=f"{type(exc).__name__}: {exc}", provider_name=provider.name))
+                result_queue.put(
+                    sender(
+                        number,
+                        provider,
+                        config,
+                        round_deadline,
+                        logger,
+                        abort_polling,
+                        round_no=round_no,
+                    )
+                )
+            except Exception as exc:
+                result_queue.put(
+                    AttemptResult(
+                        index=number,
+                        round_no=round_no,
+                        ok=False,
+                        error=f"{type(exc).__name__}: {exc}",
+                        provider_name=provider.name,
+                    )
+                )
 
-        for number in range(1, int(config["request_count"]) + 1):
-            thread = threading.Thread(target=worker, args=(number,), name=f"ccswitch-{number}", daemon=True)
+        for number in range(1, request_count + 1):
+            thread = threading.Thread(target=worker, args=(number,), name=f"ccswitch-{round_no}-{number}", daemon=True)
             thread.start()
             threads.append(thread)
+        launched_total += request_count
+        _emit_progress(
+            on_progress,
+            kind="round_start",
+            round_no=round_no,
+            max_rounds=max_rounds,
+            launched_total=launched_total,
+            completed_total=completed_total,
+            failed_total=failed_total,
+            total_cap=total_cap,
+            round_size=request_count,
+            message=provider.name,
+        )
 
-        failures = 0
-        winner: AttemptResult | None = None
-        while failures < len(threads) and time.monotonic() < round_deadline and not stop_event.is_set():
+        completed_in_round = 0
+        round_results: list[AttemptResult] = []
+        timed_out = False
+        stop_noted = False
+        while completed_in_round < request_count:
+            if stop_event.is_set() and not stop_noted:
+                stop_noted = True
+                abort_polling.set()
+                logger.log("STOPPING no new batch will be started; waiting for dispatched requests")
+                _emit_progress(
+                    on_progress,
+                    kind="stopping",
+                    round_no=round_no,
+                    max_rounds=max_rounds,
+                    launched_total=launched_total,
+                    completed_total=completed_total,
+                    failed_total=failed_total,
+                    total_cap=total_cap,
+                    completed_in_round=completed_in_round,
+                    round_size=request_count,
+                    message="正在等待已发送请求结束。",
+                )
+            remaining = round_deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                abort_polling.set()
+                break
             try:
-                item = result_queue.get(timeout=0.25)
+                item = result_queue.get(timeout=min(0.25, remaining))
             except queue.Empty:
                 continue
+            round_results.append(item)
+            completed_in_round += 1
+            completed_total += 1
             if item.ok:
-                winner = item
-                break
-            failures += 1
-            logger.log("request=%s failed status=%s error=%s" % (item.index, item.status or "", item.error[:500]))
-
-        if winner is not None:
-            logger.log(
-                "FIRST_RESULT request=%s status=%s latency_ms=%s text=%s"
-                % (winner.index, winner.status, winner.latency_ms, winner.text[:1000])
-            )
-            save_result(result_path, winner, config)
-            if on_winner is not None:
-                on_winner(winner)
-            # Keep the first result visible immediately, while every other request
-            # stays connected so Sub2API can finish pool retries/account failover.
-            drain_deadline = time.monotonic() + float(config["request_timeout_seconds"]) + 2
-            for thread in threads:
-                thread.join(timeout=max(0.0, drain_deadline - time.monotonic()))
-            completed = sum(not thread.is_alive() for thread in threads)
-            logger.log("DISPATCH_COMPLETE completed=%s requested=%s" % (completed, len(threads)))
-            return 0, winner
-
-        if stop_event.is_set():
-            abort_polling.set()
-            break
-        elapsed = time.monotonic() - started
-        if not until_success and not bool(config.get("retry_batches")):
-            logger.log("NO_RESULT the one 20-request batch completed without a successful response.")
-            return 1, None
-        if not until_success and float(config["max_wait_seconds"]) > 0 and elapsed >= float(config["max_wait_seconds"]):
-            logger.log("TIMEOUT no successful response within %.1fs" % float(config["max_wait_seconds"]))
-            return 1, None
-        logger.log(
-            "No successful response; waiting %.1fs before another %s-request round."
-            % (float(config["retry_interval_seconds"]), config["request_count"])
-        )
-        stop_event.wait(float(config["retry_interval_seconds"]))
-    return 130, None
-
-
-def launch_gui(config_path: Path) -> int:
-    try:
-        import tkinter as tk
-        from tkinter import messagebox, ttk
-    except ImportError:
-        print("当前 Python 没有 tkinter，请改用命令行模式。", file=sys.stderr)
-        return 2
-
-    root = tk.Tk()
-    root.title("CCSWITCH 并发 20 请求")
-    root.geometry("820x560")
-    root.minsize(700, 460)
-    stop_event = threading.Event()
-    running = {"thread": None}
-
-    frame = ttk.Frame(root, padding=12)
-    frame.pack(fill="both", expand=True)
-    ttk.Label(frame, text="CCSWITCH 并发 20 请求", font=("Segoe UI", 13, "bold")).pack(anchor="w")
-    ttk.Label(frame, text="窗口打开后自动发送；首个结果立即显示，其余连接继续等待服务端完成。").pack(anchor="w", pady=(2, 0))
-    status = tk.StringVar(value="准备启动…")
-    result_summary = tk.StringVar(value="等待首个返回结果")
-    ttk.Label(frame, textvariable=status).pack(anchor="w", pady=(8, 2))
-    ttk.Label(frame, textvariable=result_summary, font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
-    output = tk.Text(frame, height=23, wrap="word")
-    output.pack(fill="both", expand=True)
-    buttons = ttk.Frame(frame)
-    buttons.pack(fill="x", pady=(8, 0))
-
-    def append(line: str) -> None:
-        root.after(0, lambda: (output.insert("end", line + "\n"), output.see("end")))
-
-    def start() -> None:
-        if running["thread"] is not None and running["thread"].is_alive():
-            return
-        stop_event.clear()
-        status.set("正在并发发送 20 个请求…")
-        result_summary.set("等待首个返回结果")
-        output.delete("1.0", "end")
-        start_button.state(["disabled"])
-
-        def show_winner(winner: AttemptResult) -> None:
-            payload = winner.payload if isinstance(winner.payload, dict) else {}
-            response_id = str(payload.get("id") or "")
-            response_status = str(payload.get("status") or winner.status or "")
-            visible = winner.text or f"已收到响应：status={response_status} id={response_id}"
-
-            def update() -> None:
-                status.set(f"第 {winner.index} 个请求最先返回；结果已保存")
-                result_summary.set(visible[:500])
-
-            root.after(0, update)
-
-        def job() -> None:
-            lock = SingleRunLock(DEFAULT_LOCK_PATH)
-            try:
-                if not lock.acquire():
-                    append("已有一批请求正在运行，本次未重复发送。")
-                    root.after(0, lambda: status.set("已有任务正在运行"))
-                    return
-                cfg = load_json_config(config_path)
-                logger = RunLogger(ROOT / "logs", append)
-                code, winner = run_batch(
-                    cfg,
-                    logger,
-                    ROOT / "latest-result.json",
-                    stop_event=stop_event,
-                    on_winner=show_winner,
+                if winner is None:
+                    winner = item
+                    logger.log(
+                        "FIRST_RESULT batch=%s request=%s status=%s latency_ms=%s text=%s"
+                        % (item.round_no, item.index, item.status, item.latency_ms, item.text[:1000])
+                    )
+                    if on_winner is not None:
+                        on_winner(item)
+            else:
+                failed_total += 1
+                logger.log(
+                    "REQUEST_FAIL batch=%s request=%s status=%s error=%s"
+                    % (item.round_no, item.index, item.status or "", item.error[:500])
                 )
-                if winner is not None:
-                    root.after(0, lambda: status.set("本批 20 个请求均已结束；首个结果已保存"))
-                else:
-                    root.after(0, lambda: result_summary.set("本批没有成功响应，请查看下方错误。"))
-                    root.after(0, lambda: status.set(f"已结束，状态码 {code}"))
-            except Exception as exc:
-                append(f"ERROR {type(exc).__name__}: {exc}")
-                root.after(0, lambda: status.set("失败"))
-                root.after(0, lambda: result_summary.set(str(exc)[:500]))
-            finally:
-                lock.release()
-                root.after(0, lambda: start_button.state(["!disabled"]))
+            _emit_progress(
+                on_progress,
+                kind="first_success" if item.ok and item is winner else "request_complete",
+                round_no=round_no,
+                max_rounds=max_rounds,
+                request_index=item.index,
+                launched_total=launched_total,
+                completed_total=completed_total,
+                failed_total=failed_total,
+                total_cap=total_cap,
+                completed_in_round=completed_in_round,
+                round_size=request_count,
+                winner=winner,
+                message=item.error if not item.ok else item.text,
+            )
 
-        running["thread"] = threading.Thread(target=job, daemon=True)
-        running["thread"].start()
+        if timed_out:
+            for thread in threads:
+                thread.join(timeout=1.0)
+            unfinished = sum(thread.is_alive() for thread in threads)
+            logger.log(
+                "TIMEOUT batch=%s completed=%s requested=%s unfinished=%s"
+                % (round_no, completed_in_round, request_count, unfinished)
+            )
+            _emit_progress(
+                on_progress,
+                kind="timeout",
+                round_no=round_no,
+                max_rounds=max_rounds,
+                launched_total=launched_total,
+                completed_total=completed_total,
+                failed_total=failed_total,
+                total_cap=total_cap,
+                completed_in_round=completed_in_round,
+                round_size=request_count,
+                winner=winner,
+                message="已达到总等待时间。",
+                unfinished=unfinished,
+            )
+            return RunOutcome(0 if winner else 1, winner, launched_total, completed_total, failed_total, unfinished)
 
-    def stop() -> None:
-        stop_event.set()
-        status.set("正在停止…")
+        for thread in threads:
+            thread.join(timeout=0.2)
+        logger.log(
+            "BATCH_COMPLETE batch=%s completed=%s requested=%s success=%s"
+            % (round_no, completed_in_round, request_count, bool(winner))
+        )
+        if winner is not None:
+            _emit_progress(
+                on_progress,
+                kind="done",
+                round_no=round_no,
+                max_rounds=max_rounds,
+                launched_total=launched_total,
+                completed_total=completed_total,
+                failed_total=failed_total,
+                total_cap=total_cap,
+                completed_in_round=completed_in_round,
+                round_size=request_count,
+                winner=winner,
+                message="本批已结束。",
+            )
+            logger.log(
+                "RUN_END code=0 launched=%s completed=%s failed=%s"
+                % (launched_total, completed_total, failed_total)
+            )
+            return RunOutcome(0, winner, launched_total, completed_total, failed_total)
+        if stop_event.is_set():
+            logger.log("STOPPED by user")
+            return RunOutcome(130, None, launched_total, completed_total, failed_total)
+        if _all_failures_are_non_retryable(round_results):
+            logger.log("HARD_FAIL all responses indicate a non-retryable request/configuration error")
+            break
+        if round_no >= max_rounds:
+            break
+        if run_deadline is not None and time.monotonic() >= run_deadline:
+            logger.log("TIMEOUT no successful response within the configured total wait")
+            break
+        interval = float(config["retry_interval_seconds"])
+        logger.log(f"RETRY_WAIT seconds={interval:.1f} next_batch={round_no + 1}/{max_rounds}")
+        _emit_progress(
+            on_progress,
+            kind="retry_wait",
+            round_no=round_no,
+            max_rounds=max_rounds,
+            launched_total=launched_total,
+            completed_total=completed_total,
+            failed_total=failed_total,
+            total_cap=total_cap,
+            completed_in_round=completed_in_round,
+            round_size=request_count,
+            message=f"{interval:g} 秒后重试。",
+        )
+        if stop_event.wait(interval):
+            logger.log("STOPPED during retry wait")
+            return RunOutcome(130, None, launched_total, completed_total, failed_total)
 
-    def open_result() -> None:
-        if DEFAULT_RESULT_PATH.exists():
-            os.startfile(DEFAULT_RESULT_PATH)
-        else:
-            messagebox.showinfo("暂无结果", "还没有生成 latest-result.json。")
+    logger.log(
+        "NO_RESULT launched=%s completed=%s failed=%s batches=%s"
+        % (launched_total, completed_total, failed_total, max_rounds)
+    )
+    _emit_progress(
+        on_progress,
+        kind="no_result",
+        round_no=max_rounds,
+        max_rounds=max_rounds,
+        launched_total=launched_total,
+        completed_total=completed_total,
+        failed_total=failed_total,
+        total_cap=total_cap,
+        message="没有成功响应。",
+    )
+    return RunOutcome(1, None, launched_total, completed_total, failed_total)
 
-    def open_logs() -> None:
-        DEFAULT_LOG_DIR.mkdir(parents=True, exist_ok=True)
-        os.startfile(DEFAULT_LOG_DIR)
 
-    start_button = ttk.Button(buttons, text="重新发送 20 个", command=start)
-    start_button.pack(side="left")
-    ttk.Button(buttons, text="停止", command=stop).pack(side="left", padx=8)
-    ttk.Button(buttons, text="打开结果", command=open_result).pack(side="left")
-    ttk.Button(buttons, text="打开日志", command=open_logs).pack(side="left", padx=8)
-    ttk.Button(buttons, text="关闭", command=root.destroy).pack(side="right")
-    root.after(250, start)
-    root.mainloop()
-    return 0
+def launch_gui(initial_config: dict[str, Any], *, smoke_ui: bool = False) -> int:
+    from ccswitch_batch_sender_ui import launch_gui as _launch_gui
+
+    return _launch_gui(initial_config, smoke_ui=smoke_ui)
+
+
+def _show_already_running_message() -> None:
+    if os.name == "nt":
+        ctypes.windll.user32.MessageBoxW(None, "应用已经在运行。", APP_TITLE, 0x40)
+    else:
+        print("应用已经在运行。", file=sys.stderr)
+
+
+def _apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    updated = dict(config)
+    if args.count is not None:
+        updated["request_count"] = args.count
+    if args.retry_count is not None:
+        updated["retry_count"] = args.retry_count
+    if args.message is not None:
+        updated["message"] = args.message
+    return normalize_config(updated)
 
 
 def main(argv: Iterable[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Send 20 minimal requests through the current CCSWITCH Codex provider.")
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
-    parser.add_argument("--gui", action="store_true", help="启动简易可视化界面")
-    parser.add_argument("--dry-run", action="store_true", help="只读取 provider 并打印脱敏配置，不发送请求")
-    parser.add_argument("--until-success", action="store_true", help="无成功响应时持续轮询/重试，直到成功或手动停止")
-    parser.add_argument("--count", type=int, help="覆盖 config.json 的 request_count")
-    parser.add_argument("--message", help="覆盖 config.json 的 message")
+    parser = argparse.ArgumentParser(description="通过 CC Switch Codex provider 批量发送请求。")
+    parser.add_argument("--gui", action="store_true", help="启动桌面界面")
+    parser.add_argument("--headless", action="store_true", help="无界面发送")
+    parser.add_argument("--dry-run", action="store_true", help="只读取并显示脱敏 provider 信息，不发送请求")
+    parser.add_argument("--config", type=Path, help="可选的临时 JSON 配置；默认不需要配置文件")
+    parser.add_argument("--count", type=int, help="覆盖每批请求次数")
+    parser.add_argument("--retry-count", type=int, help="覆盖额外批次重试次数")
+    parser.add_argument("--message", help="覆盖提示词")
+    parser.add_argument("--output", type=Path, help="成功后将脱敏结果导出到指定 JSON")
+    parser.add_argument("--ui-smoke", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    if args.gui:
-        return launch_gui(args.config)
-
-    config = load_json_config(args.config)
-    if args.count is not None:
-        config["request_count"] = args.count
-    if args.message is not None:
-        config["message"] = args.message
-    if not 1 <= int(config["request_count"]) <= 100:
-        raise SenderError("--count/request_count 必须在 1 到 100 之间。")
-
-    logger = RunLogger(ROOT / "logs")
-    lock = SingleRunLock(DEFAULT_LOCK_PATH)
-    if not lock.acquire():
-        logger.log("Previous run is still active; exiting without sending another batch.")
+    config = load_json_config(args.config) if args.config else load_saved_config()
+    config = _apply_cli_overrides(config, args)
+    gui_mode = args.gui or (not args.headless and not args.dry_run)
+    mutex = SingleInstanceMutex()
+    if not mutex.acquire():
+        if gui_mode:
+            _show_already_running_message()
+        else:
+            print("应用已经在运行。", file=sys.stderr)
         return 0
     try:
-        code, winner = run_batch(
-            config,
-            logger,
-            DEFAULT_RESULT_PATH,
-            until_success=args.until_success,
-            dry_run=args.dry_run,
-        )
-        if winner is not None:
-            print(json.dumps({"ok": True, "request_index": winner.index, "text": winner.text, "result_path": str(DEFAULT_RESULT_PATH)}, ensure_ascii=False))
-        return code
+        if gui_mode:
+            enable_dpi_awareness()
+            return launch_gui(config, smoke_ui=args.ui_smoke)
+
+        logger = RunLogger()
+        outcome = run_batch(config, logger, dry_run=args.dry_run)
+        if outcome.winner is not None:
+            if args.output:
+                save_result(args.output, outcome.winner, config)
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "round": outcome.winner.round_no,
+                        "request_index": outcome.winner.index,
+                        "text": outcome.winner.text,
+                        "output": str(args.output) if args.output else "",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        return outcome.code
     except SenderError as exc:
-        logger.log(f"ERROR {exc}")
+        print(f"ERROR {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        logger.log("STOPPED by user")
+        print("STOPPED", file=sys.stderr)
         return 130
     finally:
-        lock.release()
+        mutex.release()
 
 
 if __name__ == "__main__":
