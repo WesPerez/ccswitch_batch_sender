@@ -27,13 +27,13 @@ from typing import Any, Callable, Iterable
 
 APP_NAME = "CC Switch Batch Sender"
 APP_TITLE = "CC Switch 批量请求"
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.2.0"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".cc-switch" / "cc-switch.db"
 REGISTRY_PATH = r"Software\CCSwitchBatchSender"
 REGISTRY_VALUE = "SettingsJson"
 REGISTRY_SCHEMA_VALUE = "SchemaVersion"
-REGISTRY_SCHEMA_VERSION = 2
+REGISTRY_SCHEMA_VERSION = 3
 MUTEX_NAME = r"Local\CCSwitchBatchSender.App"
 PROMPT_CACHE_KEY_PLACEHOLDER = "<每个请求唯一>"
 RANDOM_TASK_PLACEHOLDER = "<每个请求随机任务>"
@@ -42,9 +42,13 @@ RANDOM_PROBE_PLACEHOLDER = RANDOM_TASK_PLACEHOLDER
 RANDOM_TASK_PLACEHOLDERS = (RANDOM_TASK_PLACEHOLDER, LEGACY_RANDOM_PROBE_PLACEHOLDER)
 DEFAULT_FIXED_MESSAGE = "请说明批量请求为什么需要超时。"
 CODEX_VERSION_HEADER = "X-CCSwitch-Local-Codex-CLI-Version"
+TRANSPORT_CODEX_CLI = "codex_cli"
+TRANSPORT_DIRECT = "direct"
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    "transport_mode": TRANSPORT_CODEX_CLI,
+    "cli_concurrency": 4,
     "provider_id": "current",
     "model": "",
     "base_url": "",
@@ -69,6 +73,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 PERSISTED_KEYS = (
+    "transport_mode",
+    "cli_concurrency",
     "model",
     "base_url",
     "message",
@@ -239,6 +245,78 @@ class SingleInstanceMutex:
         self.handle = None
 
 
+class ActiveCodexProcessRegistry:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._processes: dict[int, subprocess.Popen[str]] = {}
+
+    def register(self, process: subprocess.Popen[str]) -> None:
+        with self._lock:
+            self._processes[process.pid] = process
+
+    def discard(self, process: subprocess.Popen[str]) -> None:
+        with self._lock:
+            self._processes.pop(process.pid, None)
+
+    def terminate_all(self) -> None:
+        with self._lock:
+            processes = list(self._processes.values())
+        for process in processes:
+            _terminate_process_tree(process)
+        with self._lock:
+            for process in processes:
+                if process.poll() is not None:
+                    self._processes.pop(process.pid, None)
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self._processes)
+
+
+ACTIVE_CODEX_PROCESSES = ActiveCodexProcessRegistry()
+
+
+def _terminate_process_tree(process: subprocess.Popen[str], timeout: float = 3.0) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        taskkill = shutil.which("taskkill")
+        if taskkill:
+            try:
+                subprocess.run(
+                    [taskkill, "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=timeout,
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+    else:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+
+    if process.poll() is None:
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+
+
+def terminate_active_codex_processes() -> None:
+    ACTIVE_CODEX_PROCESSES.terminate_all()
+
+
 def enable_dpi_awareness() -> None:
     if os.name != "nt":
         return
@@ -276,6 +354,8 @@ def normalize_config(values: dict[str, Any] | None = None) -> dict[str, Any]:
         raw.update(values)
 
     config: dict[str, Any] = {
+        "transport_mode": str(raw.get("transport_mode", TRANSPORT_CODEX_CLI)).strip().lower(),
+        "cli_concurrency": _coerce_int(raw.get("cli_concurrency"), "CLI 并发数"),
         "provider_id": str(raw.get("provider_id", "current")).strip() or "current",
         "model": str(raw.get("model", "")).strip(),
         "base_url": str(raw.get("base_url", "")).strip().rstrip("/"),
@@ -301,6 +381,10 @@ def normalize_config(values: dict[str, Any] | None = None) -> dict[str, Any]:
 
     if not 1 <= config["request_count"] <= 100:
         raise SenderError("请求次数必须在 1 到 100 之间。")
+    if config["transport_mode"] not in {TRANSPORT_CODEX_CLI, TRANSPORT_DIRECT}:
+        raise SenderError("请求来源只能是官方 Codex CLI 或直接 API。")
+    if not 1 <= config["cli_concurrency"] <= 8:
+        raise SenderError("CLI 并发数必须在 1 到 8 之间。")
     if not 0 <= config["retry_count"] <= 10:
         raise SenderError("重试次数必须在 0 到 10 之间。")
     if not 1 <= config["max_output_tokens"] <= 4096:
@@ -353,6 +437,12 @@ def migrate_saved_config(values: dict[str, Any], schema_version: int) -> dict[st
             migrated["message"] = DEFAULT_FIXED_MESSAGE
         if migrated.get("max_output_tokens") in {None, 1, "1"}:
             migrated["max_output_tokens"] = DEFAULT_CONFIG["max_output_tokens"]
+    if schema_version < 3:
+        migrated.setdefault(
+            "transport_mode",
+            TRANSPORT_DIRECT if bool(migrated.get("custom_body_enabled")) else TRANSPORT_CODEX_CLI,
+        )
+        migrated.setdefault("cli_concurrency", DEFAULT_CONFIG["cli_concurrency"])
     return migrated
 
 
@@ -706,6 +796,330 @@ def detect_codex_cli_version() -> CodexCliVersion:
     return CodexCliVersion()
 
 
+@functools.lru_cache(maxsize=1)
+def resolve_codex_cli_executable() -> Path | None:
+    package_roots: list[Path] = []
+    command = shutil.which("codex")
+    if command:
+        package_roots.append(Path(command).resolve().parent / "node_modules" / "@openai" / "codex")
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        package_roots.append(Path(appdata) / "npm" / "node_modules" / "@openai" / "codex")
+    for root in dict.fromkeys(package_roots):
+        if not root.is_dir():
+            continue
+        for candidate in root.glob("node_modules/@openai/codex-win32-*/vendor/*/bin/codex.exe"):
+            if candidate.is_file():
+                return candidate
+    executable = shutil.which("codex.exe")
+    return Path(executable) if executable else None
+
+
+def _toml_string(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def build_codex_exec_command(
+    executable: str | Path,
+    provider: Provider,
+    config: dict[str, Any],
+    base_url: str,
+) -> list[str]:
+    developer_instructions = (
+        "Answer the user's task directly. Do not call tools, inspect files, or modify the environment. "
+        "Return only the requested answer."
+    )
+    return [
+        str(executable),
+        "exec",
+        "--json",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
+        "--color",
+        "never",
+        "-m",
+        provider.model,
+        "-c",
+        f"openai_base_url={_toml_string(base_url)}",
+        "-c",
+        'approval_policy="never"',
+        "-c",
+        'model_reasoning_effort="minimal"',
+        "-c",
+        'model_verbosity="low"',
+        "-c",
+        f"developer_instructions={_toml_string(developer_instructions)}",
+        "-c",
+        'otel.exporter="none"',
+        "-",
+    ]
+
+
+def _codex_cli_endpoint_candidates(provider: Provider, style: str) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+    for endpoint in endpoint_candidates(provider, style):
+        base_url = endpoint[: -len("/responses")] if endpoint.endswith("/responses") else provider.base_url
+        candidates.append((base_url.rstrip("/"), endpoint))
+    return candidates
+
+
+def parse_codex_exec_jsonl(stdout: str) -> tuple[str, str, dict[str, Any]]:
+    final_text = ""
+    errors: list[str] = []
+    events: list[dict[str, Any]] = []
+    usage: dict[str, Any] = {}
+    thread_id = ""
+    for raw_line in (stdout or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        events.append(event)
+        event_type = str(event.get("type") or "")
+        if event_type == "thread.started":
+            thread = event.get("thread")
+            thread_id = str(
+                event.get("thread_id")
+                or (thread.get("id") if isinstance(thread, dict) else "")
+                or ""
+            )
+        elif event_type == "item.completed":
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    final_text = text.strip()
+        elif event_type == "turn.completed" and isinstance(event.get("usage"), dict):
+            usage = dict(event["usage"])
+        elif event_type in {"error", "turn.failed"}:
+            error = event.get("error") or event.get("message")
+            if isinstance(error, dict):
+                error = error.get("message") or error.get("code") or json.dumps(error, ensure_ascii=False)
+            if error:
+                errors.append(str(error))
+    payload: dict[str, Any] = {
+        "transport": TRANSPORT_CODEX_CLI,
+        "status": "completed" if final_text and not errors else "failed",
+        "thread_id": thread_id,
+        "usage": usage,
+        "events": events,
+    }
+    return final_text, " | ".join(errors), payload
+
+
+def _http_status_from_text(text: str) -> int | None:
+    match = re.search(r"\b(4\d\d|5\d\d)\b", text or "")
+    return int(match.group(1)) if match else None
+
+
+def _execute_codex_cli(
+    command: list[str],
+    prompt: str,
+    env: dict[str, str],
+    deadline: float,
+    abort_event: threading.Event | None,
+) -> tuple[int, str, str, bool]:
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=os.environ.get("TEMP") or str(Path.home()),
+        env=env,
+        creationflags=creationflags,
+    )
+    ACTIVE_CODEX_PROCESSES.register(process)
+    stopped = False
+    input_data: str | None = prompt
+    try:
+        while process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if (abort_event and abort_event.is_set()) or remaining <= 0:
+                stopped = True
+                _terminate_process_tree(process)
+                break
+            try:
+                stdout, stderr = process.communicate(input=input_data, timeout=min(0.1, remaining))
+                return int(process.returncode or 0), stdout or "", stderr or "", stopped
+            except subprocess.TimeoutExpired:
+                input_data = None
+
+        try:
+            stdout, stderr = process.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            _terminate_process_tree(process, timeout=1)
+            try:
+                stdout, stderr = process.communicate(timeout=1)
+            except (OSError, subprocess.SubprocessError):
+                stdout, stderr = "", ""
+        return int(process.returncode or 0), stdout or "", stderr or "", stopped
+    finally:
+        if process.poll() is None:
+            _terminate_process_tree(process)
+        ACTIVE_CODEX_PROCESSES.discard(process)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+
+def send_one_codex_cli(
+    index: int,
+    provider: Provider,
+    config: dict[str, Any],
+    deadline: float,
+    logger: RunLogger,
+    abort_polling: threading.Event | None = None,
+    *,
+    round_no: int = 1,
+    executor: Callable[
+        [list[str], str, dict[str, str], float, threading.Event | None],
+        tuple[int, str, str, bool],
+    ] = _execute_codex_cli,
+) -> AttemptResult:
+    started = time.monotonic()
+    if provider.api_format != "openai_responses":
+        return AttemptResult(
+            index=index,
+            round_no=round_no,
+            ok=False,
+            error="官方 Codex CLI 仅支持 Responses API provider。",
+            provider_name=provider.name,
+        )
+    executable = resolve_codex_cli_executable()
+    if executable is None:
+        return AttemptResult(
+            index=index,
+            round_no=round_no,
+            ok=False,
+            error="未找到本机官方 Codex CLI。",
+            provider_name=provider.name,
+        )
+    if bool(config.get("custom_body_enabled")):
+        return AttemptResult(
+            index=index,
+            round_no=round_no,
+            ok=False,
+            error="官方 Codex CLI 模式不支持自定义 JSON，请切换到直接 API。",
+            provider_name=provider.name,
+        )
+
+    probe = generate_probe_case() if bool(config.get("random_probe_enabled", True)) else None
+    request_prompt = probe.prompt if probe is not None else str(config["message"])
+    semaphore = config.get("_cli_semaphore")
+    acquired = False
+    if isinstance(semaphore, threading.Semaphore):
+        while time.monotonic() < deadline and not (abort_polling and abort_polling.is_set()):
+            if semaphore.acquire(timeout=0.1):
+                acquired = True
+                break
+        if not acquired:
+            return AttemptResult(
+                index=index,
+                round_no=round_no,
+                ok=False,
+                error="Codex CLI 任务在等待并发槽位时已停止或超时。",
+                provider_name=provider.name,
+                request_prompt=request_prompt,
+            )
+
+    last_error = ""
+    last_status: int | None = None
+    last_endpoint = ""
+    last_payload: Any = None
+    try:
+        for base_url, endpoint in _codex_cli_endpoint_candidates(provider, str(config["endpoint_style"])):
+            last_endpoint = endpoint
+            env = os.environ.copy()
+            env.pop("OPENAI_API_KEY", None)
+            env.pop("OPENAI_BASE_URL", None)
+            env["CODEX_API_KEY"] = provider.api_key
+            command = build_codex_exec_command(executable, provider, config, base_url)
+            return_code, stdout, stderr, stopped = executor(command, request_prompt, env, deadline, abort_polling)
+            stdout = _redact_secret_text(stdout, provider.api_key)
+            stderr = _redact_secret_text(stderr, provider.api_key)
+            response_text, event_error, payload = parse_codex_exec_jsonl(stdout)
+            last_payload = payload
+            last_status = _http_status_from_text(event_error + "\n" + stderr)
+            latency_ms = int((time.monotonic() - started) * 1000)
+            if stopped:
+                return AttemptResult(
+                    index=index,
+                    round_no=round_no,
+                    ok=False,
+                    status=last_status,
+                    error="Codex CLI 任务已停止或超时。",
+                    endpoint=endpoint,
+                    latency_ms=latency_ms,
+                    payload=payload,
+                    provider_name=provider.name,
+                    request_prompt=request_prompt,
+                )
+            if return_code == 0 and response_text:
+                if probe is not None:
+                    valid, reason = validate_probe_response(response_text, probe)
+                    if not valid:
+                        return AttemptResult(
+                            index=index,
+                            round_no=round_no,
+                            ok=False,
+                            text=response_text,
+                            error=f"随机任务语义校验失败：{reason}。",
+                            endpoint=endpoint,
+                            latency_ms=latency_ms,
+                            payload=payload,
+                            provider_name=provider.name,
+                            request_prompt=request_prompt,
+                        )
+                return AttemptResult(
+                    index=index,
+                    round_no=round_no,
+                    ok=True,
+                    text=response_text,
+                    endpoint=endpoint,
+                    latency_ms=latency_ms,
+                    payload=payload,
+                    provider_name=provider.name,
+                    request_prompt=request_prompt,
+                )
+            detail = event_error or stderr.strip() or f"Codex CLI exit {return_code}"
+            last_error = detail[-1000:]
+            if last_status not in {404, 405}:
+                break
+    except (OSError, subprocess.SubprocessError) as exc:
+        last_error = f"Codex CLI 启动失败：{exc}"
+    finally:
+        if acquired:
+            semaphore.release()
+    return AttemptResult(
+        index=index,
+        round_no=round_no,
+        ok=False,
+        status=last_status,
+        error=last_error or "Codex CLI 没有返回可用结果。",
+        endpoint=last_endpoint,
+        latency_ms=int((time.monotonic() - started) * 1000),
+        payload=last_payload,
+        provider_name=provider.name,
+        request_prompt=request_prompt,
+    )
+
+
 def build_request_headers(
     provider: Provider,
     config: dict[str, Any],
@@ -933,6 +1347,41 @@ def _redact_url(url: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
+def _redact_secret_text(text: str, secret: str) -> str:
+    if not text or not secret:
+        return text
+    redacted = text
+    candidates = {
+        secret,
+        urllib.parse.quote(secret, safe=""),
+        urllib.parse.quote_plus(secret, safe=""),
+    }
+    for candidate in sorted((item for item in candidates if item), key=len, reverse=True):
+        redacted = redacted.replace(candidate, "<redacted>")
+    return redacted
+
+
+def _redact_secret_value(value: Any, secret: str) -> Any:
+    if isinstance(value, str):
+        return _redact_secret_text(value, secret)
+    if isinstance(value, dict):
+        return {key: _redact_secret_value(item, secret) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_secret_value(item, secret) for item in value]
+    return value
+
+
+def _sanitize_attempt_result(result: AttemptResult, secret: str) -> AttemptResult:
+    result.text = _redact_secret_text(result.text, secret)
+    result.error = _redact_secret_text(result.error, secret)
+    result.payload = _redact_secret_value(result.payload, secret)
+    result.response_headers = {
+        str(key): _redact_secret_text(str(value), secret)
+        for key, value in result.response_headers.items()
+    }
+    return result
+
+
 def _json_or_text(raw: str) -> Any:
     try:
         return json.loads(raw) if raw else {}
@@ -1003,13 +1452,25 @@ def _http_request(
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8", errors="replace")
-            return response.status, _json_or_text(raw), dict(response.headers.items()), ""
+            raw = _redact_secret_text(response.read().decode("utf-8", errors="replace"), provider.api_key)
+            response_headers = {
+                str(key): _redact_secret_text(str(value), provider.api_key)
+                for key, value in response.headers.items()
+            }
+            return response.status, _json_or_text(raw), response_headers, ""
     except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")[:2000]
-        return exc.code, _json_or_text(raw), dict(exc.headers.items()) if exc.headers else {}, raw
+        raw = _redact_secret_text(exc.read().decode("utf-8", errors="replace")[:2000], provider.api_key)
+        response_headers = (
+            {
+                str(key): _redact_secret_text(str(value), provider.api_key)
+                for key, value in exc.headers.items()
+            }
+            if exc.headers
+            else {}
+        )
+        return exc.code, _json_or_text(raw), response_headers, raw
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        return None, None, {}, str(exc)
+        return None, None, {}, _redact_secret_text(str(exc), provider.api_key)
 
 
 def _request_timeout(config: dict[str, Any], deadline: float) -> float:
@@ -1218,6 +1679,7 @@ def build_result_dict(
         "completed_at": (now or dt.datetime.now().astimezone()).isoformat(timespec="seconds"),
         "round": result.round_no,
         "request_index": result.index,
+        "transport": config.get("transport_mode", TRANSPORT_DIRECT),
         "provider": result.provider_name,
         "status": result.status,
         "latency_ms": result.latency_ms,
@@ -1227,7 +1689,7 @@ def build_result_dict(
         or ("" if bool(config.get("custom_body_enabled")) else str(config["message"])),
     }
     if isinstance(result.payload, dict):
-        data["response_id"] = result.payload.get("id", "")
+        data["response_id"] = result.payload.get("id") or result.payload.get("thread_id") or ""
         data["response_status"] = result.payload.get("status", "")
         data["usage"] = result.payload.get("usage") or {}
     if bool(config.get("save_full_response")):
@@ -1268,9 +1730,19 @@ def run_batch(
     on_winner: Callable[[AttemptResult], None] | None = None,
     on_progress: Callable[[ProgressEvent], None] | None = None,
     provider_loader: Callable[[dict[str, Any]], Provider] = load_provider,
-    sender: Callable[..., AttemptResult] = send_one,
+    sender: Callable[..., AttemptResult] | None = None,
 ) -> RunOutcome:
     config = normalize_config(config)
+    transport_mode = str(config["transport_mode"])
+    uses_default_sender = sender is None
+    if sender is None:
+        sender = send_one_codex_cli if transport_mode == TRANSPORT_CODEX_CLI else send_one
+    if transport_mode == TRANSPORT_CODEX_CLI:
+        if bool(config.get("custom_body_enabled")):
+            raise SenderError("官方 Codex CLI 模式不支持自定义 JSON，请切换到直接 API。")
+        if uses_default_sender and resolve_codex_cli_executable() is None:
+            raise SenderError("未找到本机官方 Codex CLI，无法使用官方 CLI 模式。")
+        config["_cli_semaphore"] = threading.Semaphore(int(config["cli_concurrency"]))
     stop_event = stop_event or threading.Event()
     started = time.monotonic()
     request_count = int(config["request_count"])
@@ -1287,17 +1759,32 @@ def run_batch(
         task_mode = "custom-random" if request_uses_random_probe(config) else "custom"
     else:
         task_mode = "random" if request_uses_random_probe(config) else "fixed"
-    logger.log(
-        "RUN_START count=%s retries=%s post_cap=%s task_mode=%s codex_cli=%s codex_header=%s client=ccswitch-batch-sender"
-        % (
-            request_count,
-            config["retry_count"],
-            total_cap,
-            task_mode,
-            codex_version.version or "unavailable",
-            "on" if bool(config.get("send_codex_version_header", True)) else "off",
+    if transport_mode == TRANSPORT_CODEX_CLI:
+        logger.log(
+            "RUN_START count=%s retries=%s task_cap=%s task_mode=%s transport=official-codex-cli "
+            "codex_cli=%s cli_concurrency=%s"
+            % (
+                request_count,
+                config["retry_count"],
+                total_cap,
+                task_mode,
+                codex_version.version or "unavailable",
+                config["cli_concurrency"],
+            )
         )
-    )
+    else:
+        logger.log(
+            "RUN_START count=%s retries=%s post_cap=%s task_mode=%s transport=direct-api "
+            "codex_cli=%s codex_header=%s client=ccswitch-batch-sender"
+            % (
+                request_count,
+                config["retry_count"],
+                total_cap,
+                task_mode,
+                codex_version.version or "unavailable",
+                "on" if bool(config.get("send_codex_version_header", True)) else "off",
+            )
+        )
 
     for round_no in range(1, max_rounds + 1):
         if stop_event.is_set():
@@ -1318,19 +1805,36 @@ def run_batch(
             return RunOutcome(1, winner, launched_total, completed_total, failed_total)
 
         provider = provider_loader(config)
+        if transport_mode == TRANSPORT_CODEX_CLI and provider.api_format != "openai_responses":
+            raise SenderError("所选 provider 使用 Chat Completions，官方 Codex CLI 仅支持 Responses API。")
         endpoints = endpoint_candidates(provider, str(config["endpoint_style"]))
         if dry_run:
-            logger.log(
-                "DRY_RUN provider=%s model=%s api_format=%s count=%s retries=%s endpoints=%s"
-                % (
-                    provider.name,
-                    provider.model,
-                    provider.api_format,
-                    request_count,
-                    config["retry_count"],
-                    [_redact_url(item) for item in endpoints],
+            if transport_mode == TRANSPORT_CODEX_CLI:
+                logger.log(
+                    "DRY_RUN transport=official-codex-cli provider=%s model=%s api_format=%s "
+                    "tasks=%s retries=%s cli_concurrency=%s endpoints=%s"
+                    % (
+                        provider.name,
+                        provider.model,
+                        provider.api_format,
+                        request_count,
+                        config["retry_count"],
+                        config["cli_concurrency"],
+                        [_redact_url(item) for item in endpoints],
+                    )
                 )
-            )
+            else:
+                logger.log(
+                    "DRY_RUN transport=direct-api provider=%s model=%s api_format=%s count=%s retries=%s endpoints=%s"
+                    % (
+                        provider.name,
+                        provider.model,
+                        provider.api_format,
+                        request_count,
+                        config["retry_count"],
+                        [_redact_url(item) for item in endpoints],
+                    )
+                )
             _emit_progress(
                 on_progress,
                 kind="dry_run",
@@ -1347,8 +1851,16 @@ def run_batch(
         now = time.monotonic()
         round_deadline = run_deadline if run_deadline is not None else now + float(config["request_timeout_seconds"])
         logger.log(
-            "BATCH_START batch=%s/%s sending=%s provider=%s model=%s api_format=%s"
-            % (round_no, max_rounds, request_count, provider.name, provider.model, provider.api_format)
+            "BATCH_START batch=%s/%s sending=%s transport=%s provider=%s model=%s api_format=%s"
+            % (
+                round_no,
+                max_rounds,
+                request_count,
+                "official-codex-cli" if transport_mode == TRANSPORT_CODEX_CLI else "direct-api",
+                provider.name,
+                provider.model,
+                provider.api_format,
+            )
         )
         result_queue: queue.Queue[AttemptResult] = queue.Queue()
         threads: list[threading.Thread] = []
@@ -1356,30 +1868,34 @@ def run_batch(
 
         def worker(number: int) -> None:
             try:
-                result_queue.put(
-                    sender(
-                        number,
-                        provider,
-                        config,
-                        round_deadline,
-                        logger,
-                        abort_polling,
-                        round_no=round_no,
-                    )
+                item = sender(
+                    number,
+                    provider,
+                    config,
+                    round_deadline,
+                    logger,
+                    abort_polling,
+                    round_no=round_no,
                 )
+                result_queue.put(_sanitize_attempt_result(item, provider.api_key))
             except Exception as exc:
                 result_queue.put(
                     AttemptResult(
                         index=number,
                         round_no=round_no,
                         ok=False,
-                        error=f"{type(exc).__name__}: {exc}",
+                        error=_redact_secret_text(f"{type(exc).__name__}: {exc}", provider.api_key),
                         provider_name=provider.name,
                     )
                 )
 
         for number in range(1, request_count + 1):
-            thread = threading.Thread(target=worker, args=(number,), name=f"ccswitch-{round_no}-{number}", daemon=True)
+            thread = threading.Thread(
+                target=worker,
+                args=(number,),
+                name=f"ccswitch-{transport_mode}-{round_no}-{number}",
+                daemon=True,
+            )
             thread.start()
             threads.append(thread)
         launched_total += request_count
@@ -1586,6 +2102,10 @@ def _show_already_running_message() -> None:
 
 def _apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     updated = dict(config)
+    if args.transport is not None:
+        updated["transport_mode"] = args.transport
+    if args.cli_concurrency is not None:
+        updated["cli_concurrency"] = args.cli_concurrency
     if args.count is not None:
         updated["request_count"] = args.count
     if args.retry_count is not None:
@@ -1605,6 +2125,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--headless", action="store_true", help="无界面发送")
     parser.add_argument("--dry-run", action="store_true", help="只读取并显示脱敏 provider 信息，不发送请求")
     parser.add_argument("--config", type=Path, help="可选的临时 JSON 配置；默认不需要配置文件")
+    parser.add_argument(
+        "--transport",
+        choices=[TRANSPORT_CODEX_CLI, TRANSPORT_DIRECT],
+        help="请求来源：codex_cli 使用官方 Codex CLI；direct 使用直接 API",
+    )
+    parser.add_argument("--cli-concurrency", type=int, help="官方 Codex CLI 模式的最大并发任务数")
     parser.add_argument("--count", type=int, help="覆盖每批请求次数")
     parser.add_argument("--retry-count", type=int, help="覆盖额外批次重试次数")
     parser.add_argument("--message", help="覆盖提示词")
@@ -1663,6 +2189,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         _console_print("STOPPED", error=True)
         return 130
     finally:
+        terminate_active_codex_processes()
         mutex.release()
 
 

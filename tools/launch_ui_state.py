@@ -8,7 +8,7 @@ from tkinter import ttk
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ccswitch_batch_sender import enable_dpi_awareness, load_saved_config
+from ccswitch_batch_sender import TRANSPORT_DIRECT, enable_dpi_awareness, load_saved_config
 from ccswitch_batch_sender_ui import BatchSenderApp
 
 
@@ -30,6 +30,8 @@ def main() -> int:
     if args.view == "advanced" and notebooks:
         notebooks[0].select(1)
     elif args.view == "custom":
+        app.transport_mode_var.set(TRANSPORT_DIRECT)
+        app._on_transport_changed()
         app.refresh_preview()
         app.custom_body_var.set(True)
         app.toggle_custom_body()

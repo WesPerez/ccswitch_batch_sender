@@ -2,12 +2,44 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import os
+import shutil
 import subprocess
 import time
 from ctypes import wintypes
 from pathlib import Path
 
 from PIL import ImageGrab
+
+
+def terminate_process_tree(process: subprocess.Popen[bytes], timeout: float = 5.0) -> None:
+    if os.name == "nt":
+        taskkill = shutil.which("taskkill")
+        if taskkill:
+            try:
+                subprocess.run(
+                    [taskkill, "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=timeout,
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+    if process.poll() is None:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        process.wait(timeout=timeout)
 
 
 def find_window_for_pid(pid: int) -> int:
@@ -89,13 +121,7 @@ def main() -> int:
         print(f"captured {args.output.resolve()} {image.size} hwnd={hwnd:#x}")
         return 0
     finally:
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+        terminate_process_tree(process)
 
 
 if __name__ == "__main__":

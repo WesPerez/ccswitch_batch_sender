@@ -17,6 +17,8 @@ from ccswitch_batch_sender import (
     LEGACY_RANDOM_PROBE_PLACEHOLDER,
     PROMPT_CACHE_KEY_PLACEHOLDER,
     RANDOM_TASK_PLACEHOLDER,
+    TRANSPORT_CODEX_CLI,
+    TRANSPORT_DIRECT,
     AttemptResult,
     ProgressEvent,
     Provider,
@@ -32,10 +34,12 @@ from ccswitch_batch_sender import (
     list_codex_providers,
     load_provider,
     normalize_config,
+    resolve_codex_cli_executable,
     resource_path,
     run_batch,
     save_result,
     save_saved_config,
+    terminate_active_codex_processes,
 )
 
 
@@ -354,6 +358,8 @@ class BatchSenderApp:
         )
 
     def _init_variables(self) -> None:
+        self.transport_mode_var = tk.StringVar()
+        self.cli_concurrency_var = tk.StringVar()
         self.provider_var = tk.StringVar()
         self.provider_meta_var = tk.StringVar(value="正在读取 CC Switch provider")
         self.provider_state_var = tk.StringVar(value="")
@@ -419,13 +425,53 @@ class BatchSenderApp:
         self.provider_combo = ttk.Combobox(provider_band, textvariable=self.provider_var, state="readonly")
         self.provider_combo.grid(row=0, column=1, sticky="ew")
         self._editable_ttk.append(self.provider_combo)
+        segments = tk.Frame(provider_band, bg=BORDER, bd=0, padx=1, pady=1)
+        segments.grid(row=0, column=2, padx=(8, 0))
+        self.codex_transport_radio = tk.Radiobutton(
+            segments,
+            text="Codex CLI",
+            variable=self.transport_mode_var,
+            value=TRANSPORT_CODEX_CLI,
+            indicatoron=False,
+            command=self._on_transport_changed,
+            bg=SURFACE_SOFT,
+            fg=TEXT,
+            selectcolor=ACCENT_SOFT,
+            activebackground=ACCENT_SOFT,
+            activeforeground=ACCENT,
+            font=FONT_BODY_MEDIUM,
+            relief="flat",
+            bd=0,
+            padx=7,
+            pady=5,
+        )
+        self.codex_transport_radio.grid(row=0, column=0, sticky="nsew")
+        self.direct_transport_radio = tk.Radiobutton(
+            segments,
+            text="直接 API",
+            variable=self.transport_mode_var,
+            value=TRANSPORT_DIRECT,
+            indicatoron=False,
+            command=self._on_transport_changed,
+            bg=SURFACE_SOFT,
+            fg=TEXT,
+            selectcolor=ACCENT_SOFT,
+            activebackground=ACCENT_SOFT,
+            activeforeground=ACCENT,
+            font=FONT_BODY_MEDIUM,
+            relief="flat",
+            bd=0,
+            padx=7,
+            pady=5,
+        )
+        self.direct_transport_radio.grid(row=0, column=1, sticky="nsew", padx=(1, 0))
         self.refresh_button = self._tool_button(provider_band, "refresh", self.refresh_providers, "刷新 provider")
-        self.refresh_button.grid(row=0, column=2, padx=(8, 0))
+        self.refresh_button.grid(row=0, column=3, padx=(8, 0))
         ttk.Label(provider_band, textvariable=self.provider_meta_var, style="Meta.TLabel").grid(
             row=1, column=1, sticky="w", pady=(5, 0)
         )
         self.provider_state_label = ttk.Label(provider_band, textvariable=self.provider_state_var, style="Meta.TLabel")
-        self.provider_state_label.grid(row=1, column=2, sticky="e", padx=(8, 0), pady=(5, 0))
+        self.provider_state_label.grid(row=1, column=2, columnspan=2, sticky="e", padx=(8, 0), pady=(5, 0))
 
         content = ttk.Frame(main, style="App.TFrame")
         content.grid(row=1, column=0, sticky="nsew")
@@ -439,8 +485,8 @@ class BatchSenderApp:
         left.grid_rowconfigure(0, weight=1)
         settings_tabs = ttk.Notebook(left)
         settings_tabs.grid(row=0, column=0, sticky="nsew")
-        common_tab = ttk.Frame(settings_tabs, style="Surface.TFrame", padding=(2, 9, 2, 0))
-        advanced_tab = ttk.Frame(settings_tabs, style="Surface.TFrame", padding=(2, 9, 2, 0))
+        common_tab = ttk.Frame(settings_tabs, style="Surface.TFrame", padding=(2, 5, 2, 0))
+        advanced_tab = ttk.Frame(settings_tabs, style="Surface.TFrame", padding=(2, 5, 2, 0))
         settings_tabs.add(common_tab, text="发送设置")
         settings_tabs.add(advanced_tab, text="高级设置")
         self._build_common_settings(common_tab)
@@ -454,12 +500,12 @@ class BatchSenderApp:
         self.output_tabs.grid(row=0, column=0, sticky="nsew")
         body_tab = ttk.Frame(self.output_tabs, style="Surface.TFrame", padding=(2, 8, 2, 0))
         log_tab = ttk.Frame(self.output_tabs, style="Surface.TFrame", padding=(2, 8, 2, 0))
-        self.output_tabs.add(body_tab, text="请求体")
+        self.output_tabs.add(body_tab, text="请求预览")
         self.output_tabs.add(log_tab, text="运行日志")
         self._build_body_tab(body_tab)
         self._build_log_tab(log_tab)
 
-        status_band = ttk.Frame(main, style="Surface.TFrame", padding=(12, 10))
+        status_band = ttk.Frame(main, style="Surface.TFrame", padding=(12, 7))
         status_band.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         status_band.grid_columnconfigure(0, weight=42, uniform="status")
         status_band.grid_columnconfigure(1, weight=58, uniform="status")
@@ -496,7 +542,8 @@ class BatchSenderApp:
 
     def _build_common_settings(self, parent: ttk.Frame) -> None:
         parent.grid_columnconfigure(0, weight=1)
-        parent.grid_rowconfigure(1, weight=1)
+        parent.grid_rowconfigure(1, weight=1, minsize=52)
+
         prompt_header = ttk.Frame(parent, style="Surface.TFrame")
         prompt_header.grid(row=0, column=0, sticky="ew")
         prompt_header.grid_columnconfigure(0, weight=1)
@@ -511,7 +558,7 @@ class BatchSenderApp:
         self._editable_ttk.append(self.random_probe_check)
         self.prompt_text = tk.Text(
             parent,
-            height=4,
+            height=2,
             wrap="word",
             undo=True,
             bg=SURFACE_SOFT,
@@ -527,7 +574,7 @@ class BatchSenderApp:
             padx=8,
             pady=7,
         )
-        self.prompt_text.grid(row=1, column=0, sticky="nsew", pady=(5, 9))
+        self.prompt_text.grid(row=1, column=0, sticky="nsew", pady=(4, 5))
 
         numeric = ttk.Frame(parent, style="Surface.TFrame")
         numeric.grid(row=2, column=0, sticky="ew")
@@ -559,7 +606,7 @@ class BatchSenderApp:
             increment=1,
         )
         ttk.Label(parent, textvariable=self.limit_var, style="Limit.TLabel").grid(
-            row=3, column=0, sticky="w", pady=(10, 0)
+            row=3, column=0, sticky="w", pady=(8, 0)
         )
 
     def _build_advanced_settings(self, parent: ttk.Frame) -> None:
@@ -569,14 +616,14 @@ class BatchSenderApp:
         ttk.Label(parent, text="模型覆盖", style="Field.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(parent, text="Endpoint 模式", style="Field.TLabel").grid(row=0, column=1, sticky="w", padx=(8, 0))
         self.model_entry = ttk.Entry(parent, textvariable=self.model_override_var)
-        self.model_entry.grid(row=1, column=0, sticky="ew", pady=(4, 9))
+        self.model_entry.grid(row=1, column=0, sticky="ew", pady=(3, 5))
         self.endpoint_combo = ttk.Combobox(
             parent,
             textvariable=self.endpoint_style_var,
             values=list(ENDPOINT_LABELS),
             state="readonly",
         )
-        self.endpoint_combo.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(4, 9))
+        self.endpoint_combo.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(3, 5))
 
         options_line = ttk.Frame(parent, style="Surface.TFrame")
         options_line.grid(row=2, column=0, columnspan=2, sticky="ew")
@@ -607,11 +654,11 @@ class BatchSenderApp:
         self.codex_version_check.grid(row=0, column=3, sticky="e", padx=(8, 0))
         Tooltip(self.codex_version_check, "向 provider 附带本机 Codex CLI 版本请求头")
         self.base_url_entry = ttk.Entry(parent, textvariable=self.base_url_override_var)
-        self.base_url_entry.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 9))
+        self.base_url_entry.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(3, 5))
 
         timing = ttk.Frame(parent, style="Surface.TFrame")
         timing.grid(row=4, column=0, columnspan=2, sticky="ew")
-        for column in range(3):
+        for column in range(4):
             timing.grid_columnconfigure(column, weight=1, uniform="timing")
         self.max_tokens_spin = self._spin_field(
             timing,
@@ -637,6 +684,14 @@ class BatchSenderApp:
             0,
             86400,
         )
+        self.cli_concurrency_spin = self._spin_field(
+            timing,
+            3,
+            "CLI 并发",
+            self.cli_concurrency_var,
+            1,
+            8,
+        )
 
         self._editable_ttk.extend(
             [
@@ -646,6 +701,7 @@ class BatchSenderApp:
                 self.max_tokens_spin,
                 self.request_timeout_spin,
                 self.max_wait_spin,
+                self.cli_concurrency_spin,
                 self.unique_check,
                 self.full_response_check,
                 self.codex_version_check,
@@ -773,7 +829,7 @@ class BatchSenderApp:
         self.result_export_button.state(["disabled"])
         self.result_text = tk.Text(
             frame,
-            height=4,
+            height=2,
             wrap="word",
             state="disabled",
             bg=SURFACE_SOFT,
@@ -806,7 +862,7 @@ class BatchSenderApp:
         holder.grid_columnconfigure(0, weight=1)
         ttk.Label(holder, text=label, style="Field.TLabel").grid(row=0, column=0, sticky="w")
         spin = ttk.Spinbox(holder, textvariable=variable, from_=minimum, to=maximum, increment=increment)
-        spin.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        spin.grid(row=1, column=0, sticky="ew", pady=(2, 0))
         self._editable_ttk.append(spin)
         return spin
 
@@ -881,6 +937,7 @@ class BatchSenderApp:
             self.request_timeout_var,
             self.max_wait_var,
             self.poll_interval_var,
+            self.cli_concurrency_var,
         ):
             variable.trace_add("write", lambda *_args: self.schedule_preview())
         self.unique_cache_var.trace_add("write", lambda *_args: self.schedule_preview())
@@ -894,6 +951,8 @@ class BatchSenderApp:
 
     def _load_initial_values(self) -> None:
         config = self.base_config
+        self.transport_mode_var.set(str(config["transport_mode"]))
+        self.cli_concurrency_var.set(str(config["cli_concurrency"]))
         self._replace_text(self.prompt_text, str(config["message"]))
         self.random_probe_var.set(bool(config["random_probe_enabled"]))
         self.request_count_var.set(str(config["request_count"]))
@@ -917,6 +976,12 @@ class BatchSenderApp:
             self.body_text.configure(state="disabled")
         self._update_body_management()
         self._update_limit_text()
+        self.metrics_var.set(
+            "已启动 0 · 已完成 0 · 失败 0"
+            if config["transport_mode"] == TRANSPORT_CODEX_CLI
+            else "已发送 0 · 已完成 0 · 失败 0"
+        )
+        self._apply_transport_state()
 
     @staticmethod
     def _number_text(value: Any) -> str:
@@ -993,6 +1058,34 @@ class BatchSenderApp:
             if self.custom_body_var.get():
                 self.schedule_preview()
 
+    def _on_transport_changed(self) -> None:
+        if self.running:
+            return
+        if self.transport_mode_var.get() == TRANSPORT_CODEX_CLI:
+            self.custom_body_var.set(False)
+            self.metrics_var.set("已启动 0 · 已完成 0 · 失败 0")
+        else:
+            self.metrics_var.set("已发送 0 · 已完成 0 · 失败 0")
+        self._apply_transport_state()
+        self.schedule_preview()
+
+    def _apply_transport_state(self) -> None:
+        cli_mode = self.transport_mode_var.get() == TRANSPORT_CODEX_CLI
+        editable = not self.running
+        radio_state = "normal" if editable else "disabled"
+        self.codex_transport_radio.configure(state=radio_state)
+        self.direct_transport_radio.configure(state=radio_state)
+
+        for widget in (self.max_tokens_spin, self.unique_check, self.codex_version_check, self.custom_body_check, self.body_reset_button):
+            widget.state(["!disabled"] if editable and not cli_mode else ["disabled"])
+        self.cli_concurrency_spin.state(["!disabled"] if editable and cli_mode else ["disabled"])
+        if cli_mode:
+            self.body_text.configure(state="disabled")
+        elif editable and self.custom_body_var.get():
+            self.body_text.configure(state="normal")
+        elif not self.custom_body_var.get():
+            self.body_text.configure(state="disabled")
+
     def schedule_preview(self) -> None:
         self._update_limit_text()
         if self.preview_after_id is not None:
@@ -1007,7 +1100,28 @@ class BatchSenderApp:
             config = self.collect_config()
             provider = load_provider(config)
             self.preview_provider = provider
-            if not self.custom_body_var.get():
+            cli_mode = config["transport_mode"] == TRANSPORT_CODEX_CLI
+            if cli_mode:
+                executable = resolve_codex_cli_executable()
+                if executable is None:
+                    raise SenderError("未找到本机官方 Codex CLI")
+                if provider.api_format != "openai_responses":
+                    raise SenderError("官方 Codex CLI 仅支持 Responses API provider")
+                prompt_preview = RANDOM_TASK_PLACEHOLDER if bool(config["random_probe_enabled"]) else str(config["message"])
+                summary = {
+                    "request_source": "official_codex_cli",
+                    "codex_cli": detect_codex_cli_version().version or "unknown",
+                    "provider": provider.name,
+                    "model": provider.model,
+                    "task": prompt_preview,
+                    "cli_concurrency": int(config["cli_concurrency"]),
+                    "endpoint_candidates": endpoint_candidates(provider, str(config["endpoint_style"])),
+                    "request_metadata": "generated_by_official_codex_cli",
+                }
+                self._set_body_text(json.dumps(summary, ensure_ascii=False, indent=2), editable=False)
+                self.body_mode_var.set("官方 CLI 生成 · 只读")
+                self.body_mode_label.configure(style="Managed.TLabel")
+            elif not self.custom_body_var.get():
                 body = build_preview_body(provider, config)
                 self._set_body_text(json.dumps(body, ensure_ascii=False, indent=2), editable=False)
             else:
@@ -1016,12 +1130,16 @@ class BatchSenderApp:
             host = urllib.parse.urlsplit(provider.base_url).netloc or provider.base_url
             format_label = "Responses" if provider.api_format == "openai_responses" else "Chat Completions"
             codex_version = detect_codex_cli_version().version or "未检测"
-            self.provider_meta_var.set(f"{provider.model}  ·  {format_label}  ·  {host}  ·  Codex CLI {codex_version}")
+            transport_label = f"CLI {codex_version}" if cli_mode else "直接 API"
+            self.provider_meta_var.set(
+                f"{provider.model}  ·  {format_label}  ·  {host}  ·  {transport_label}"
+            )
             if self._selected_provider_id() == "current":
                 self.provider_state_var.set("跟随 CC Switch")
             else:
                 self.provider_state_var.set("仅本次使用")
             self.can_start = True
+            self._apply_transport_state()
             self._refresh_start_state()
         except (SenderError, json.JSONDecodeError) as exc:
             self.preview_provider = None
@@ -1035,6 +1153,8 @@ class BatchSenderApp:
         data = dict(self.base_config)
         data.update(
             {
+                "transport_mode": self.transport_mode_var.get(),
+                "cli_concurrency": self.cli_concurrency_var.get(),
                 "provider_id": self._selected_provider_id(),
                 "model": self.model_override_var.get().strip(),
                 "base_url": self.base_url_override_var.get().strip(),
@@ -1051,10 +1171,11 @@ class BatchSenderApp:
                 "unique_prompt_cache_key": self.unique_cache_var.get(),
                 "send_codex_version_header": self.send_codex_version_var.get(),
                 "save_full_response": self.save_full_response_var.get(),
-                "custom_body_enabled": self.custom_body_var.get(),
+                "custom_body_enabled": self.custom_body_var.get()
+                and self.transport_mode_var.get() == TRANSPORT_DIRECT,
             }
         )
-        if self.custom_body_var.get():
+        if self.custom_body_var.get() and self.transport_mode_var.get() == TRANSPORT_DIRECT:
             raw_body = self.body_text.get("1.0", "end-1c").strip()
             try:
                 data["custom_body"] = json.loads(raw_body)
@@ -1066,6 +1187,11 @@ class BatchSenderApp:
 
     def toggle_custom_body(self) -> None:
         if self.running:
+            return
+        if self.transport_mode_var.get() == TRANSPORT_CODEX_CLI:
+            self.custom_body_var.set(False)
+            self._show_notice("自定义 JSON 仅用于直接 API 模式")
+            self._apply_transport_state()
             return
         if self.custom_body_var.get():
             try:
@@ -1095,8 +1221,14 @@ class BatchSenderApp:
             count = int(self.request_count_var.get())
             retries = int(self.retry_count_var.get())
             cap = count * (1 + retries)
-            self.limit_var.set(f"单次运行最多 {cap} 个 POST")
-            self.start_button.configure(text=f"发送 {count} 个") if hasattr(self, "start_button") else None
+            if self.transport_mode_var.get() == TRANSPORT_CODEX_CLI:
+                concurrency = int(self.cli_concurrency_var.get())
+                self.limit_var.set(f"上限 {cap} 个任务 · CLI 并发 {concurrency}")
+                button_text = f"运行 {count} 个任务"
+            else:
+                self.limit_var.set(f"上限 {cap} 个 POST")
+                button_text = f"发送 {count} 个"
+            self.start_button.configure(text=button_text) if hasattr(self, "start_button") else None
         except (TypeError, ValueError):
             self.limit_var.set("请求次数或重试次数无效")
 
@@ -1118,7 +1250,7 @@ class BatchSenderApp:
         self.run_started_at = time.monotonic()
         self.progressbar.configure(maximum=int(config["request_count"]) * (1 + int(config["retry_count"])), value=0)
         self.progress_text_var.set("正在准备请求")
-        self.metrics_var.set("已发送 0 · 已完成 0 · 失败 0")
+        self.metrics_var.set("已启动 0 · 已完成 0 · 失败 0" if config["transport_mode"] == TRANSPORT_CODEX_CLI else "已发送 0 · 已完成 0 · 失败 0")
         self.result_title_var.set("首个成功结果")
         self._set_readonly_text(self.result_text, "等待首个成功响应")
         self.result_copy_button.state(["disabled"])
@@ -1152,7 +1284,7 @@ class BatchSenderApp:
         if not self.running or self.stop_event.is_set():
             return
         self.stop_event.set()
-        self.progress_text_var.set("正在停止，等待已发送请求结束")
+        self.progress_text_var.set("正在停止，等待已启动任务结束")
         self._set_status("stopping")
         self.stop_button.state(["disabled"])
 
@@ -1167,8 +1299,9 @@ class BatchSenderApp:
 
     def apply_progress(self, event: ProgressEvent) -> None:
         self.progressbar.configure(maximum=max(1, event.total_cap), value=event.completed_total)
+        launched_label = "已启动" if self.last_run_config and self.last_run_config.get("transport_mode") == TRANSPORT_CODEX_CLI else "已发送"
         self.metrics_var.set(
-            f"已发送 {event.launched_total}/{event.total_cap} · 已完成 {event.completed_total} · 失败 {event.failed_total}"
+            f"{launched_label} {event.launched_total}/{event.total_cap} · 已完成 {event.completed_total} · 失败 {event.failed_total}"
         )
         if event.kind == "round_start":
             self.progress_text_var.set(f"第 {event.round_no}/{event.max_rounds} 批正在发送")
@@ -1194,7 +1327,12 @@ class BatchSenderApp:
     def show_winner(self, result: AttemptResult) -> None:
         self.latest_result = result
         text = result.text.strip() or "已收到成功响应"
-        lines = [f"第 {result.round_no} 批 #{result.index} · HTTP {result.status or '-'} · {result.latency_ms} ms"]
+        source_label = (
+            "Codex CLI"
+            if self.last_run_config and self.last_run_config.get("transport_mode") == TRANSPORT_CODEX_CLI
+            else f"HTTP {result.status or '-'}"
+        )
+        lines = [f"第 {result.round_no} 批 #{result.index} · {source_label} · {result.latency_ms} ms"]
         if result.request_prompt:
             lines.append(f"请求：{result.request_prompt}")
         lines.append(f"响应：{text}")
@@ -1210,7 +1348,7 @@ class BatchSenderApp:
         self._stop_elapsed_clock()
         if outcome.unfinished > 0:
             self.blocked_by_unfinished = True
-            self.progress_text_var.set(f"仍有 {outcome.unfinished} 个请求未结束；关闭应用可中断")
+            self.progress_text_var.set(f"仍有 {outcome.unfinished} 个任务未结束；关闭应用可中断")
             self._set_status("warning")
             self._set_editing_enabled(True)
             self.start_button.state(["disabled"])
@@ -1376,6 +1514,7 @@ class BatchSenderApp:
         self.refresh_button.state(["!disabled"] if enabled else ["disabled"])
         self.save_settings_button.state(["!disabled"] if enabled else ["disabled"])
         self.reset_button.state(["!disabled"] if enabled else ["disabled"])
+        self._apply_transport_state()
         self._refresh_start_state()
 
     def _refresh_start_state(self) -> None:
@@ -1456,16 +1595,20 @@ class BatchSenderApp:
         if self.running or self.blocked_by_unfinished:
             if not messagebox.askyesno(
                 "关闭应用",
-                "仍有请求在运行。关闭会中断这些连接，是否继续？",
+                "仍有任务在运行。关闭会中断这些连接，是否继续？",
                 parent=self.root,
             ):
                 return
         self.stop_event.set()
+        terminate_active_codex_processes()
         self.root.destroy()
 
 
 def launch_gui(initial_config: dict[str, Any], *, smoke_ui: bool = False) -> int:
     root = tk.Tk()
     BatchSenderApp(root, initial_config, smoke_ui=smoke_ui)
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        terminate_active_codex_processes()
     return 0

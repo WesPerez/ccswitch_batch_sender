@@ -4,12 +4,15 @@ import json
 import os
 import random
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
 import uuid
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import ccswitch_batch_sender as sender
@@ -104,6 +107,8 @@ class ConfigTests(unittest.TestCase):
 
     def test_default_uses_random_real_probes(self) -> None:
         config = sender.normalize_config()
+        self.assertEqual(config["transport_mode"], sender.TRANSPORT_CODEX_CLI)
+        self.assertEqual(config["cli_concurrency"], 4)
         self.assertTrue(config["random_probe_enabled"])
         self.assertGreaterEqual(config["max_output_tokens"], 32)
 
@@ -112,6 +117,11 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(migrated["random_probe_enabled"])
         self.assertEqual(migrated["message"], sender.DEFAULT_FIXED_MESSAGE)
         self.assertEqual(migrated["max_output_tokens"], sender.DEFAULT_CONFIG["max_output_tokens"])
+
+    def test_v2_saved_custom_json_stays_on_direct_transport(self) -> None:
+        migrated = sender.migrate_saved_config({"custom_body_enabled": True}, 2)
+        self.assertEqual(migrated["transport_mode"], sender.TRANSPORT_DIRECT)
+        self.assertEqual(migrated["cli_concurrency"], 4)
 
     def test_custom_body_can_replace_the_prompt(self) -> None:
         config = sender.normalize_config(
@@ -353,6 +363,138 @@ class ProtocolTests(unittest.TestCase):
     def test_codex_version_parser_accepts_cli_output(self) -> None:
         self.assertEqual(sender.parse_codex_cli_version("codex-cli 0.144.5"), "0.144.5")
 
+    def test_codex_exec_command_uses_official_cli_without_exposing_key(self) -> None:
+        config = sender.normalize_config({"transport_mode": sender.TRANSPORT_CODEX_CLI})
+        command = sender.build_codex_exec_command(
+            Path("C:/tools/codex.exe"),
+            self.provider,
+            config,
+            "https://api.example.test/v1",
+        )
+        rendered = " ".join(command)
+        self.assertIn("codex.exe", command[0])
+        self.assertIn("exec", command)
+        self.assertIn("--ephemeral", command)
+        self.assertIn("--ignore-user-config", command)
+        self.assertIn('openai_base_url="https://api.example.test/v1"', command)
+        self.assertNotIn("secret", rendered)
+        self.assertNotIn("CC Switch Batch Sender", rendered)
+
+    def test_parse_codex_exec_jsonl_extracts_final_message_and_usage(self) -> None:
+        stdout = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"id": "item-1", "type": "agent_message", "text": "完成"},
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 12, "output_tokens": 3}}),
+            ]
+        )
+        text, error, payload = sender.parse_codex_exec_jsonl(stdout)
+        self.assertEqual(text, "完成")
+        self.assertEqual(error, "")
+        self.assertEqual(payload["thread_id"], "thread-1")
+        self.assertEqual(payload["usage"]["output_tokens"], 3)
+
+    def test_codex_cli_sender_passes_key_only_through_child_environment(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def fake_executor(command, prompt, env, deadline, abort_event):
+            captured.update({"command": command, "prompt": prompt, "env": env})
+            stdout = json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "固定回答"},
+                },
+                ensure_ascii=False,
+            )
+            return 0, stdout, "", False
+
+        config = sender.normalize_config(
+            {
+                "transport_mode": sender.TRANSPORT_CODEX_CLI,
+                "random_probe_enabled": False,
+                "message": "固定任务",
+            }
+        )
+        with mock.patch.object(sender, "resolve_codex_cli_executable", return_value=Path("C:/tools/codex.exe")):
+            result = sender.send_one_codex_cli(
+                1,
+                self.provider,
+                config,
+                time.monotonic() + 5,
+                sender.RunLogger(callback=lambda _line: None),
+                executor=fake_executor,
+            )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.text, "固定回答")
+        self.assertEqual(captured["prompt"], "固定任务")
+        self.assertEqual(captured["env"]["CODEX_API_KEY"], "secret")
+        self.assertNotIn("secret", " ".join(captured["command"]))
+
+    def test_codex_cli_timeout_terminates_registered_process(self) -> None:
+        before = sender.ACTIVE_CODEX_PROCESSES.count()
+        return_code, stdout, stderr, stopped = sender._execute_codex_cli(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            "small prompt",
+            os.environ.copy(),
+            time.monotonic() + 0.15,
+            None,
+        )
+        self.assertTrue(stopped)
+        self.assertNotEqual(return_code, 0)
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, "")
+        self.assertEqual(sender.ACTIVE_CODEX_PROCESSES.count(), before)
+
+    def test_active_registry_terminates_registered_process(self) -> None:
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        sender.ACTIVE_CODEX_PROCESSES.register(process)
+        try:
+            sender.terminate_active_codex_processes()
+            process.wait(timeout=3)
+            self.assertIsNotNone(process.returncode)
+            self.assertEqual(sender.ACTIVE_CODEX_PROCESSES.count(), 0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=3)
+            sender.ACTIVE_CODEX_PROCESSES.discard(process)
+
+    def test_codex_cli_errors_redact_provider_key(self) -> None:
+        def fake_executor(command, prompt, env, deadline, abort_event):
+            stdout = json.dumps(
+                {"type": "error", "message": f"Authorization: Bearer {self.provider.api_key}"}
+            )
+            return 1, stdout, f"upstream echoed {self.provider.api_key}", False
+
+        config = sender.normalize_config(
+            {
+                "transport_mode": sender.TRANSPORT_CODEX_CLI,
+                "random_probe_enabled": False,
+                "message": "固定任务",
+            }
+        )
+        with mock.patch.object(sender, "resolve_codex_cli_executable", return_value=Path("C:/tools/codex.exe")):
+            result = sender.send_one_codex_cli(
+                1,
+                self.provider,
+                config,
+                time.monotonic() + 5,
+                sender.RunLogger(callback=lambda _line: None),
+                executor=fake_executor,
+            )
+        rendered = json.dumps(result.__dict__, ensure_ascii=False)
+        self.assertNotIn(self.provider.api_key, rendered)
+        self.assertIn("<redacted>", rendered)
+
     def test_endpoint_candidates_keep_existing_fallback_order(self) -> None:
         self.assertEqual(
             sender.endpoint_candidates(self.provider, "auto"),
@@ -465,10 +607,61 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(outcome.launched, 0)
         run_start = next(line for line in lines if "RUN_START" in line)
         self.assertIn("task_mode=random", run_start)
-        self.assertIn("codex_header=on", run_start)
-        self.assertIn("client=ccswitch-batch-sender", run_start)
+        self.assertIn("transport=official-codex-cli", run_start)
+        self.assertIn("cli_concurrency=4", run_start)
         self.assertNotIn("third-party", run_start)
         self.assertNotIn("random-probe", run_start)
+
+    def test_direct_transport_keeps_transparent_client_identity(self) -> None:
+        lines: list[str] = []
+        outcome = sender.run_batch(
+            sender.normalize_config(
+                {
+                    "transport_mode": sender.TRANSPORT_DIRECT,
+                    "request_count": 1,
+                    "retry_count": 0,
+                }
+            ),
+            sender.RunLogger(callback=lines.append),
+            dry_run=True,
+            provider_loader=lambda _config: self.provider,
+            sender=lambda *args, **kwargs: None,
+        )
+        self.assertEqual(outcome.code, 0)
+        run_start = next(line for line in lines if "RUN_START" in line)
+        self.assertIn("transport=direct-api", run_start)
+        self.assertIn("client=ccswitch-batch-sender", run_start)
+        self.assertIn("post_cap=1", run_start)
+
+    def test_runner_redacts_provider_key_before_logging(self) -> None:
+        lines: list[str] = []
+
+        def fake_sender(index, provider, config, deadline, logger, abort_polling, *, round_no=1):
+            return sender.AttemptResult(
+                index=index,
+                round_no=round_no,
+                ok=False,
+                status=500,
+                error=f"Authorization: Bearer {provider.api_key}",
+                payload={"error": provider.api_key},
+                provider_name=provider.name,
+            )
+
+        outcome = sender.run_batch(
+            sender.normalize_config(
+                {
+                    "transport_mode": sender.TRANSPORT_DIRECT,
+                    "request_count": 1,
+                    "retry_count": 0,
+                }
+            ),
+            sender.RunLogger(callback=lines.append),
+            provider_loader=lambda _config: self.provider,
+            sender=fake_sender,
+        )
+        self.assertEqual(outcome.code, 1)
+        self.assertNotIn(self.provider.api_key, "\n".join(lines))
+        self.assertIn("<redacted>", "\n".join(lines))
 
 
 if __name__ == "__main__":
