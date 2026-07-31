@@ -24,12 +24,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
+
 
 APP_NAME = "CC Switch Batch Sender"
 APP_TITLE = "CC Switch 批量请求"
-APP_VERSION = "2.2.2"
+APP_VERSION = "2.2.3"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".cc-switch" / "cc-switch.db"
+DIAGNOSTIC_LOG_MAX_BYTES = 512 * 1024
+DIAGNOSTIC_LOG_BACKUP_COUNT = 2
 REGISTRY_PATH = r"Software\CCSwitchBatchSender"
 REGISTRY_VALUE = "SettingsJson"
 REGISTRY_SCHEMA_VALUE = "SchemaVersion"
@@ -44,6 +51,10 @@ DEFAULT_FIXED_MESSAGE = "请说明批量请求为什么需要超时。"
 CODEX_VERSION_HEADER = "X-CCSwitch-Local-Codex-CLI-Version"
 TRANSPORT_CODEX_CLI = "codex_cli"
 TRANSPORT_DIRECT = "direct"
+PROXY_MANAGED_TOKEN = "PROXY_MANAGED"
+CODEX_RESERVED_MODEL_PROVIDER_IDS = frozenset(
+    {"amazon-bedrock", "openai", "ollama", "lmstudio", "oss", "ollama-chat"}
+)
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -215,6 +226,93 @@ class RunLogger:
             self._callback(line)
         elif self.path is None:
             _console_print(line)
+
+
+def default_provider_diagnostics_path() -> Path:
+    local_app_data = str(os.environ.get("LOCALAPPDATA") or "").strip()
+    if local_app_data:
+        root = Path(local_app_data) / "CCSwitchBatchSender"
+    else:
+        root = Path.home() / ".ccswitch-batch-sender"
+    return root / "logs" / "provider-diagnostics.jsonl"
+
+
+class ProviderDiagnostics:
+    _SENSITIVE_FIELD = re.compile(
+        r"(?:api.?key|authorization|credential|password|secret|token)",
+        re.IGNORECASE,
+    )
+
+    def __init__(
+        self,
+        path: Path | None = None,
+        *,
+        max_bytes: int = DIAGNOSTIC_LOG_MAX_BYTES,
+        backup_count: int = DIAGNOSTIC_LOG_BACKUP_COUNT,
+    ) -> None:
+        self.path = path or default_provider_diagnostics_path()
+        self.max_bytes = max(1, int(max_bytes))
+        self.backup_count = max(0, int(backup_count))
+        self._lock = threading.Lock()
+
+    @classmethod
+    def _is_sensitive_field(cls, field_name: str) -> bool:
+        return field_name not in {"credential_source", "has_api_key"} and bool(
+            cls._SENSITIVE_FIELD.search(field_name)
+        )
+
+    @classmethod
+    def _safe_value(cls, value: Any) -> Any:
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, dict):
+            return {
+                str(key): cls._safe_value(item)
+                for key, item in value.items()
+                if not cls._is_sensitive_field(str(key))
+            }
+        if isinstance(value, (list, tuple)):
+            return [cls._safe_value(item) for item in value]
+        return str(value)
+
+    def _rotate_if_needed(self, incoming_bytes: int) -> None:
+        try:
+            current_size = self.path.stat().st_size
+        except OSError:
+            return
+        if current_size <= 0 or current_size + incoming_bytes <= self.max_bytes:
+            return
+        if self.backup_count <= 0:
+            self.path.unlink(missing_ok=True)
+            return
+        for index in range(self.backup_count, 0, -1):
+            source = self.path if index == 1 else self.path.with_name(f"{self.path.name}.{index - 1}")
+            target = self.path.with_name(f"{self.path.name}.{index}")
+            if source.exists():
+                source.replace(target)
+
+    def record(self, event: str, **fields: Any) -> None:
+        payload: dict[str, Any] = {
+            "timestamp": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "event": str(event),
+            "app_version": APP_VERSION,
+            "pid": os.getpid(),
+        }
+        for key, value in fields.items():
+            field_name = str(key)
+            if self._is_sensitive_field(field_name):
+                continue
+            payload[field_name] = self._safe_value(value)
+        line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+        encoded_size = len(line.encode("utf-8"))
+        try:
+            with self._lock:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._rotate_if_needed(encoded_size)
+                with self.path.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+        except OSError:
+            return
 
 
 class SingleInstanceMutex:
@@ -512,22 +610,129 @@ def save_saved_config(config: dict[str, Any]) -> None:
         )
 
 
-def parse_assignment(text: str, key: str) -> str:
-    pattern = re.compile(
-        rf"^\s*{re.escape(key)}\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^#\r\n]+?))\s*(?:#.*)?$",
-        re.MULTILINE,
-    )
-    match = pattern.search(text or "")
-    if not match:
-        return ""
-    return next((part.strip() for part in match.groups() if part is not None), "")
-
-
 def _config_value(config_obj: Any, key: str) -> str:
-    if isinstance(config_obj, dict):
-        value = config_obj.get(key)
-        return str(value).strip() if value is not None else ""
-    return parse_assignment(str(config_obj or ""), key)
+    document = config_obj if isinstance(config_obj, dict) else _toml_document(config_obj)
+    if not document:
+        return ""
+    if key in {"base_url", "wire_api"}:
+        provider_config = _active_model_provider_config(document)
+        value = provider_config.get(key) if key in provider_config else document.get(key)
+    else:
+        value = document.get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _normalized_direct_api_key(value: Any) -> tuple[str, str]:
+    if not isinstance(value, str):
+        return "", "none"
+    token = value.strip()
+    if not token:
+        return "", "none"
+    candidate = token[7:].strip() if token.casefold().startswith("bearer ") else token
+    folded = candidate.casefold()
+    if PROXY_MANAGED_TOKEN.casefold() in folded or "xai_oauth_placeholder" in folded:
+        return "", "proxy_managed"
+    return candidate, "usable"
+
+
+def _toml_document(config_blob: Any) -> dict[str, Any]:
+    if isinstance(config_blob, dict):
+        return config_blob
+    if not isinstance(config_blob, str):
+        return {}
+    text = config_blob.strip()
+    if not text:
+        return {}
+    try:
+        parsed = tomllib.loads(text)
+    except (tomllib.TOMLDecodeError, TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _active_model_provider_config(document: dict[str, Any]) -> dict[str, Any]:
+    raw_provider_id = document.get("model_provider")
+    provider_id = raw_provider_id.strip() if isinstance(raw_provider_id, str) else ""
+    providers = document.get("model_providers")
+    provider_config = providers.get(provider_id) if provider_id and isinstance(providers, dict) else None
+    return provider_config if isinstance(provider_config, dict) else {}
+
+
+def _config_experimental_bearer_token(config_blob: Any) -> tuple[str, str]:
+    document = _toml_document(config_blob)
+    if not document:
+        return "", "none"
+
+    raw_provider_id = document.get("model_provider")
+    provider_id = raw_provider_id.strip() if isinstance(raw_provider_id, str) else ""
+    top_level, top_level_state = _normalized_direct_api_key(
+        document.get("experimental_bearer_token")
+    )
+    if provider_id and provider_id.casefold() not in CODEX_RESERVED_MODEL_PROVIDER_IDS:
+        provider_config = _active_model_provider_config(document)
+        if provider_config:
+            provider_token, provider_state = _normalized_direct_api_key(
+                provider_config.get("experimental_bearer_token")
+            )
+            if provider_token:
+                return provider_token, "active_provider"
+            if provider_state == "proxy_managed":
+                return "", provider_state
+    if top_level:
+        return top_level, "top_level"
+    return "", top_level_state
+
+
+def _auth_has_oauth_material(auth: dict[str, Any]) -> bool:
+    for key, value in auth.items():
+        if str(key) in {"auth_mode", "OPENAI_API_KEY"} or value is None:
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                return True
+        elif isinstance(value, (list, tuple, dict, set)):
+            if value:
+                return True
+        else:
+            return True
+    return False
+
+
+def _provider_identity_block_reason(category: Any, meta: dict[str, Any]) -> str:
+    if str(category or "").strip().casefold() == "official":
+        return "official"
+    provider_type = str(meta.get("providerType") or meta.get("provider_type") or "").strip().casefold()
+    if provider_type == "xai_oauth":
+        return "managed_oauth"
+    return ""
+
+
+def _provider_api_key(
+    settings: dict[str, Any],
+    config_blob: Any,
+    *,
+    category: Any = None,
+    meta: dict[str, Any] | None = None,
+) -> tuple[str, str]:
+    identity_reason = _provider_identity_block_reason(category, meta or {})
+    if identity_reason:
+        return "", identity_reason
+    auth = settings.get("auth")
+    auth = auth if isinstance(auth, dict) else {}
+    api_key, auth_state = _normalized_direct_api_key(auth.get("OPENAI_API_KEY"))
+    if api_key:
+        return api_key, "auth"
+    if auth_state == "proxy_managed":
+        return "", auth_state
+    if _auth_has_oauth_material(auth):
+        return "", "oauth"
+
+    config_key, config_state = _config_experimental_bearer_token(config_blob)
+    if config_key:
+        return config_key, config_state
+    if config_state == "proxy_managed":
+        return "", config_state
+    return "", "none"
 
 
 def resolve_db_path(config: dict[str, Any] | None = None) -> Path:
@@ -623,14 +828,19 @@ def _infer_api_format(meta: dict[str, Any], config_blob: Any) -> str:
     return ""
 
 
-def list_codex_providers(config: dict[str, Any] | None = None) -> ProviderCatalog:
+def list_codex_providers(
+    config: dict[str, Any] | None = None,
+    *,
+    diagnostics: ProviderDiagnostics | None = None,
+) -> ProviderCatalog:
     db_path = resolve_db_path(config)
     connection = _connect_readonly(db_path)
     try:
+        pointer_id = _settings_current_provider_id(_settings_path_for_db(db_path))
         current_id = _resolve_current_provider_id(connection, _settings_path_for_db(db_path), strict=False)
         rows = connection.execute(
             """
-            SELECT id, name, settings_config, meta, is_current, sort_index
+            SELECT id, name, settings_config, meta, category, is_current, sort_index
             FROM providers
             WHERE app_type = 'codex'
             ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END, sort_index, id
@@ -643,15 +853,24 @@ def list_codex_providers(config: dict[str, Any] | None = None) -> ProviderCatalo
             name = str(row["name"] or row["id"])
             try:
                 settings, meta, config_blob = _decode_provider_row(row)
-                auth = settings.get("auth") if isinstance(settings, dict) else {}
-                auth = auth if isinstance(auth, dict) else {}
-                has_api_key = bool(str(auth.get("OPENAI_API_KEY") or "").strip())
+                api_key, credential_source = _provider_api_key(
+                    settings,
+                    config_blob,
+                    category=row["category"],
+                    meta=meta,
+                )
+                has_api_key = bool(api_key)
                 base_url = _config_value(config_blob, "base_url").rstrip("/")
                 model = _config_value(config_blob, "model")
                 api_format = _infer_api_format(meta, config_blob)
                 missing = []
                 if not has_api_key:
-                    missing.append("无 API Key")
+                    if credential_source == "proxy_managed":
+                        missing.append("凭据由 CC Switch 代理托管")
+                    elif credential_source in {"official", "managed_oauth", "oauth"}:
+                        missing.append("OAuth/托管凭据不可直接发送")
+                    else:
+                        missing.append("无 API Key")
                 if not base_url:
                     missing.append("无地址")
                 if not model:
@@ -685,24 +904,48 @@ def list_codex_providers(config: dict[str, Any] | None = None) -> ProviderCatalo
                         unavailable_reason=str(exc),
                     )
                 )
-        return ProviderCatalog(current_provider_id=current_id, providers=tuple(providers))
+        catalog = ProviderCatalog(current_provider_id=current_id, providers=tuple(providers))
+        if diagnostics is not None:
+            diagnostics.record(
+                "PROVIDER_CATALOG",
+                pointer_provider_id=pointer_id,
+                resolved_current_provider_id=current_id,
+                database_current_provider_ids=[
+                    str(row["id"]) for row in rows if bool(row["is_current"])
+                ],
+                provider_count=len(providers),
+            )
+        return catalog
     finally:
         connection.close()
 
 
-def load_provider(config: dict[str, Any]) -> Provider:
+def load_provider(
+    config: dict[str, Any],
+    *,
+    current_provider_id: str | None = None,
+    diagnostics: ProviderDiagnostics | None = None,
+) -> Provider:
     db_path = resolve_db_path(config)
     connection = _connect_readonly(db_path)
     try:
         requested_id = str(config.get("provider_id") or "current").strip()
-        provider_id = (
-            _resolve_current_provider_id(connection, _settings_path_for_db(db_path), strict=True)
-            if requested_id.lower() == "current"
-            else requested_id
-        )
+        if requested_id.lower() == "current":
+            if current_provider_id is None:
+                provider_id = _resolve_current_provider_id(
+                    connection,
+                    _settings_path_for_db(db_path),
+                    strict=True,
+                )
+            else:
+                provider_id = str(current_provider_id).strip()
+                if not provider_id:
+                    raise SenderError("CC Switch 当前 provider 快照未识别，请刷新后重试。")
+        else:
+            provider_id = requested_id
         row = connection.execute(
             """
-            SELECT id, name, settings_config, meta
+            SELECT id, name, settings_config, meta, category
             FROM providers
             WHERE app_type = 'codex' AND id = ?
             LIMIT 1
@@ -710,15 +953,46 @@ def load_provider(config: dict[str, Any]) -> Provider:
             (provider_id,),
         ).fetchone()
         if row is None:
+            if diagnostics is not None:
+                diagnostics.record(
+                    "PROVIDER_LOAD",
+                    requested_provider_id=requested_id,
+                    resolved_provider_id=provider_id,
+                    current_snapshot_used=current_provider_id is not None,
+                    result="missing",
+                )
             raise SenderError(f"CC Switch Codex provider 不存在：{provider_id}")
 
         settings, meta, config_blob = _decode_provider_row(row)
-        auth = settings.get("auth") if isinstance(settings, dict) else {}
-        auth = auth if isinstance(auth, dict) else {}
-        api_key = str(auth.get("OPENAI_API_KEY") or "").strip()
+        api_key, credential_source = _provider_api_key(
+            settings,
+            config_blob,
+            category=row["category"],
+            meta=meta,
+        )
         if not api_key:
+            if diagnostics is not None:
+                diagnostics.record(
+                    "PROVIDER_LOAD",
+                    requested_provider_id=requested_id,
+                    resolved_provider_id=provider_id,
+                    current_snapshot_used=current_provider_id is not None,
+                    credential_source=credential_source,
+                    has_api_key=False,
+                    result="unavailable",
+                )
+            if credential_source == "proxy_managed":
+                raise SenderError(
+                    f"provider 的凭据由 CC Switch 本地代理托管：{row['name']}。"
+                    "Batch Sender 不能把 PROXY_MANAGED 占位符直接发送给上游。"
+                )
+            if credential_source in {"official", "managed_oauth", "oauth"}:
+                raise SenderError(
+                    f"provider 使用 OAuth 或托管登录凭据：{row['name']}。"
+                    "这类凭据必须由 Codex 或 CC Switch 代理注入，不能按 API Key 直接发送。"
+                )
             raise SenderError(
-                f"provider 没有 OPENAI_API_KEY：{row['name']}。"
+                f"provider 没有可直接使用的 API Key：{row['name']}。"
                 "官方 OAuth provider 不能按 API Key 方式直接发送。"
             )
 
@@ -731,7 +1005,7 @@ def load_provider(config: dict[str, Any]) -> Provider:
             raise SenderError(f"provider 没有 model：{row['name']}")
         if not api_format:
             raise SenderError(f"无法判断 provider 的 API 格式：{row['name']}")
-        return Provider(
+        provider = Provider(
             provider_id=str(row["id"]),
             name=str(row["name"]),
             api_key=api_key,
@@ -739,6 +1013,17 @@ def load_provider(config: dict[str, Any]) -> Provider:
             model=model,
             api_format=api_format,
         )
+        if diagnostics is not None:
+            diagnostics.record(
+                "PROVIDER_LOAD",
+                requested_provider_id=requested_id,
+                resolved_provider_id=provider.provider_id,
+                current_snapshot_used=current_provider_id is not None,
+                credential_source=credential_source,
+                has_api_key=True,
+                result="ok",
+            )
+        return provider
     finally:
         connection.close()
 
@@ -1798,6 +2083,10 @@ def run_batch(
         task_mode = "custom-random" if request_uses_random_probe(config) else "custom"
     else:
         task_mode = "random" if request_uses_random_probe(config) else "fixed"
+    provider = provider_loader(config)
+    if transport_mode == TRANSPORT_CODEX_CLI and provider.api_format != "openai_responses":
+        raise SenderError("所选 provider 使用 Chat Completions，官方 Codex CLI 仅支持 Responses API。")
+    endpoints = endpoint_candidates(provider, str(config["endpoint_style"]))
     if transport_mode == TRANSPORT_CODEX_CLI:
         logger.log(
             "RUN_START count=%s retries=%s task_cap=%s task_mode=%s transport=official-codex-cli "
@@ -1843,10 +2132,6 @@ def run_batch(
             logger.log("TIMEOUT reached before starting the next batch")
             return RunOutcome(1, winner, launched_total, completed_total, failed_total)
 
-        provider = provider_loader(config)
-        if transport_mode == TRANSPORT_CODEX_CLI and provider.api_format != "openai_responses":
-            raise SenderError("所选 provider 使用 Chat Completions，官方 Codex CLI 仅支持 Responses API。")
-        endpoints = endpoint_candidates(provider, str(config["endpoint_style"]))
         if dry_run:
             if transport_mode == TRANSPORT_CODEX_CLI:
                 logger.log(
@@ -2134,10 +2419,15 @@ def run_batch(
     return RunOutcome(1, None, launched_total, completed_total, failed_total)
 
 
-def launch_gui(initial_config: dict[str, Any], *, smoke_ui: bool = False) -> int:
+def launch_gui(
+    initial_config: dict[str, Any],
+    *,
+    smoke_ui: bool = False,
+    diagnostics: ProviderDiagnostics | None = None,
+) -> int:
     from ccswitch_batch_sender_ui import launch_gui as _launch_gui
 
-    return _launch_gui(initial_config, smoke_ui=smoke_ui)
+    return _launch_gui(initial_config, smoke_ui=smoke_ui, diagnostics=diagnostics)
 
 
 def _show_already_running_message() -> None:
@@ -2192,12 +2482,24 @@ def main(argv: Iterable[str] | None = None) -> int:
     prompt_mode.add_argument("--fixed-prompt", dest="random_probes", action="store_false", help="使用固定提示词")
     parser.set_defaults(random_probes=None)
     parser.add_argument("--output", type=Path, help="成功后将脱敏结果导出到指定 JSON")
+    parser.add_argument(
+        "--no-provider-diagnostics",
+        action="store_true",
+        help="不写入本机 provider 解析诊断日志",
+    )
     parser.add_argument("--ui-smoke", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     config = load_json_config(args.config) if args.config else load_saved_config()
     config = _apply_cli_overrides(config, args)
     gui_mode = args.gui or (not args.headless and not args.dry_run)
+    diagnostics = None if args.no_provider_diagnostics else ProviderDiagnostics()
+    if diagnostics is not None:
+        diagnostics.record(
+            "APP_START",
+            mode="gui" if gui_mode else "headless",
+            frozen=bool(getattr(sys, "frozen", False)),
+        )
     mutex = SingleInstanceMutex()
     if not mutex.acquire():
         if gui_mode:
@@ -2208,10 +2510,15 @@ def main(argv: Iterable[str] | None = None) -> int:
     try:
         if gui_mode:
             enable_dpi_awareness()
-            return launch_gui(config, smoke_ui=args.ui_smoke)
+            return launch_gui(config, smoke_ui=args.ui_smoke, diagnostics=diagnostics)
 
         logger = RunLogger()
-        outcome = run_batch(config, logger, dry_run=args.dry_run)
+        outcome = run_batch(
+            config,
+            logger,
+            dry_run=args.dry_run,
+            provider_loader=lambda current: load_provider(current, diagnostics=diagnostics),
+        )
         if outcome.winner is not None:
             if args.output:
                 save_result(args.output, outcome.winner, config)

@@ -16,13 +16,35 @@ from typing import Any
 from unittest import mock
 
 import ccswitch_batch_sender as sender
+import ccswitch_batch_sender_ui as sender_ui
 
 
-def provider_settings(*, key: str = "test-key", base_url: str = "https://api.example.test", model: str = "gpt-test") -> str:
+def provider_settings(
+    *,
+    key: str = "test-key",
+    base_url: str = "https://api.example.test",
+    model: str = "gpt-test",
+    config_token: str = "",
+    auth_extra: dict[str, Any] | None = None,
+    config_text: str | None = None,
+) -> str:
+    auth = {"OPENAI_API_KEY": key}
+    if auth_extra:
+        auth.update(auth_extra)
+    token_line = f'experimental_bearer_token = "{config_token}"\n' if config_token else ""
     return json.dumps(
         {
-            "auth": {"OPENAI_API_KEY": key},
-            "config": f'model = "{model}"\nbase_url = "{base_url}"\nwire_api = "responses"\n',
+            "auth": auth,
+            "config": config_text
+            if config_text is not None
+            else (
+                'model_provider = "custom"\n'
+                f'model = "{model}"\n'
+                "[model_providers.custom]\n"
+                f'base_url = "{base_url}"\n'
+                'wire_api = "responses"\n'
+                f"{token_line}"
+            ),
         }
     )
 
@@ -41,6 +63,7 @@ class TempCcSwitchDb:
                 name TEXT NOT NULL,
                 settings_config TEXT,
                 meta TEXT,
+                category TEXT,
                 is_current INTEGER DEFAULT 0,
                 sort_index INTEGER DEFAULT 0
             )
@@ -58,22 +81,42 @@ class TempCcSwitchDb:
         key: str = "test-key",
         model: str = "gpt-test",
         base_url: str = "https://api.example.test",
+        config_token: str = "",
+        auth_extra: dict[str, Any] | None = None,
+        config_text: str | None = None,
         app_type: str = "codex",
         api_format: str = "openai_responses",
+        category: str | None = None,
+        provider_type: str = "",
         sort_index: int = 0,
     ) -> None:
         connection = sqlite3.connect(self.db_path)
         connection.execute(
             """
-            INSERT INTO providers (id, app_type, name, settings_config, meta, is_current, sort_index)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO providers (
+                id, app_type, name, settings_config, meta, category, is_current, sort_index
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 provider_id,
                 app_type,
                 name,
-                provider_settings(key=key, base_url=base_url, model=model),
-                json.dumps({"apiFormat": api_format}),
+                provider_settings(
+                    key=key,
+                    base_url=base_url,
+                    model=model,
+                    config_token=config_token,
+                    auth_extra=auth_extra,
+                    config_text=config_text,
+                ),
+                json.dumps(
+                    {
+                        "apiFormat": api_format,
+                        **({"providerType": provider_type} if provider_type else {}),
+                    }
+                ),
+                category,
                 int(current),
                 sort_index,
             ),
@@ -96,6 +139,32 @@ class ConfigTests(unittest.TestCase):
         logger = sender.RunLogger()
         with mock.patch.object(sender.sys, "stdout", None), mock.patch.object(sender.sys, "stderr", None):
             logger.log("windowed dry run")
+
+    def test_provider_diagnostics_drop_sensitive_fields_and_rotate(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ccswitch-diagnostics-test-") as temp:
+            path = Path(temp) / "provider-diagnostics.jsonl"
+            diagnostics = sender.ProviderDiagnostics(path=path, max_bytes=180, backup_count=1)
+            diagnostics.record(
+                "PROVIDER_LOAD",
+                provider_id="provider-a",
+                credential_source="config",
+                has_api_key=True,
+                api_key="must-not-be-written",
+                authorization="Bearer must-not-be-written",
+                credential="must-not-be-written",
+                details={"api_key": "nested-must-not-be-written", "result": "ok"},
+            )
+            diagnostics.record("PROVIDER_LOAD", provider_id="provider-b", note="x" * 200)
+
+            rendered = path.read_text(encoding="utf-8")
+            rotated = path.with_name(path.name + ".1").read_text(encoding="utf-8")
+            combined = rendered + rotated
+            self.assertIn("PROVIDER_LOAD", combined)
+            self.assertIn("credential_source", combined)
+            self.assertNotIn("must-not-be-written", combined)
+            self.assertNotIn("nested-must-not-be-written", combined)
+            self.assertNotIn('"api_key"', combined)
+            self.assertNotIn('"authorization"', combined)
 
     def test_zero_request_count_is_rejected_instead_of_replaced(self) -> None:
         with self.assertRaises(sender.SenderError):
@@ -218,6 +287,307 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(len(catalog.providers), 1)
         self.assertFalse(catalog.providers[0].available)
         self.assertIn("无 API Key", catalog.providers[0].unavailable_reason)
+
+    def test_config_bearer_token_matches_cc_switch_credential_fallback(self) -> None:
+        self.db.add(
+            "provider-a",
+            "Provider A",
+            current=True,
+            key="",
+            config_token="config-secret",
+        )
+        config = sender.normalize_config({"db_path": str(self.db.db_path), "provider_id": "current"})
+
+        catalog = sender.list_codex_providers(config)
+        provider = sender.load_provider(config)
+
+        self.assertTrue(catalog.providers[0].has_api_key)
+        self.assertTrue(catalog.providers[0].available)
+        self.assertEqual(provider.api_key, "config-secret")
+
+    def test_provider_load_diagnostics_record_source_without_key(self) -> None:
+        self.db.add(
+            "provider-a",
+            "Provider A",
+            current=True,
+            key="",
+            config_token="config-secret",
+        )
+        config = sender.normalize_config({"db_path": str(self.db.db_path), "provider_id": "current"})
+        log_path = self.db.root / "provider-diagnostics.jsonl"
+        diagnostics = sender.ProviderDiagnostics(path=log_path)
+
+        sender.load_provider(config, diagnostics=diagnostics)
+
+        rendered = log_path.read_text(encoding="utf-8")
+        self.assertIn('"credential_source":"active_provider"', rendered)
+        self.assertIn('"resolved_provider_id":"provider-a"', rendered)
+        self.assertNotIn("config-secret", rendered)
+
+    def test_auth_key_takes_precedence_over_config_token(self) -> None:
+        self.db.add(
+            "provider-a",
+            "Provider A",
+            current=True,
+            key="auth-secret",
+            config_token="config-secret",
+        )
+        config = sender.normalize_config({"db_path": str(self.db.db_path)})
+        self.assertEqual(sender.load_provider(config).api_key, "auth-secret")
+
+    def test_bearer_prefixed_auth_key_is_normalized_before_transport_use(self) -> None:
+        self.db.add(
+            "provider-a",
+            "Provider A",
+            current=True,
+            key="Bearer real-secret",
+        )
+        config = sender.normalize_config({"db_path": str(self.db.db_path)})
+
+        provider = sender.load_provider(config)
+        headers = sender.build_request_headers(
+            provider,
+            config,
+            codex_version=sender.CodexCliVersion(version="", source="test"),
+        )
+
+        self.assertEqual(provider.api_key, "real-secret")
+        self.assertEqual(headers["Authorization"], "Bearer real-secret")
+
+    def test_only_active_provider_section_can_supply_config_token(self) -> None:
+        config_text = """model_provider = "active"
+model = "gpt-test"
+
+[model_providers.active]
+base_url = "https://api.example.test"
+wire_api = "responses"
+
+[model_providers.inactive]
+experimental_bearer_token = "inactive-secret"
+"""
+        self.db.add(
+            "provider-a",
+            "Provider A",
+            current=True,
+            key="",
+            config_text=config_text,
+        )
+        config = sender.normalize_config({"db_path": str(self.db.db_path)})
+        with self.assertRaises(sender.SenderError):
+            sender.load_provider(config)
+
+    def test_provider_endpoint_and_wire_api_come_from_active_toml_section(self) -> None:
+        config_text = """model_provider = "active"
+model = "active-model"
+
+[model_providers.inactive]
+base_url = "https://inactive.example.test"
+wire_api = "chat"
+
+[model_providers.active]
+base_url = "https://active.example.test"
+wire_api = "responses"
+"""
+        self.db.add(
+            "provider-a",
+            "Provider A",
+            current=True,
+            config_text=config_text,
+            api_format="",
+        )
+        config = sender.normalize_config({"db_path": str(self.db.db_path)})
+
+        catalog = sender.list_codex_providers(config)
+        provider = sender.load_provider(config)
+
+        self.assertEqual(catalog.providers[0].base_url, "https://active.example.test")
+        self.assertEqual(catalog.providers[0].api_format, "openai_responses")
+        self.assertEqual(provider.base_url, "https://active.example.test")
+        self.assertEqual(provider.api_format, "openai_responses")
+
+    def test_model_is_read_only_from_the_toml_top_level(self) -> None:
+        config_text = """model_provider = "active"
+
+[model_providers.inactive]
+model = "inactive-model"
+base_url = "https://inactive.example.test"
+
+[model_providers.active]
+model = "active-section-model"
+base_url = "https://active.example.test"
+wire_api = "responses"
+"""
+        self.db.add(
+            "provider-a",
+            "Provider A",
+            current=True,
+            config_text=config_text,
+            api_format="",
+        )
+        config = sender.normalize_config({"db_path": str(self.db.db_path)})
+
+        catalog = sender.list_codex_providers(config)
+
+        self.assertFalse(catalog.providers[0].available)
+        self.assertIn("无模型", catalog.providers[0].unavailable_reason)
+        with self.assertRaisesRegex(sender.SenderError, "没有 model"):
+            sender.load_provider(config)
+
+    def test_legacy_top_level_toml_endpoint_remains_supported(self) -> None:
+        config_text = """model = "legacy-model"
+base_url = "https://legacy.example.test"
+wire_api = "responses"
+"""
+        self.db.add(
+            "provider-a",
+            "Provider A",
+            current=True,
+            config_text=config_text,
+            api_format="",
+        )
+        config = sender.normalize_config({"db_path": str(self.db.db_path)})
+
+        provider = sender.load_provider(config)
+
+        self.assertEqual(provider.model, "legacy-model")
+        self.assertEqual(provider.base_url, "https://legacy.example.test")
+        self.assertEqual(provider.api_format, "openai_responses")
+
+    def test_top_level_token_is_fallback_for_active_custom_provider(self) -> None:
+        config_text = """model_provider = "active"
+model = "gpt-test"
+experimental_bearer_token = "top-level-secret"
+
+[model_providers.active]
+base_url = "https://api.example.test"
+wire_api = "responses"
+"""
+        self.db.add(
+            "provider-a",
+            "Provider A",
+            current=True,
+            key="",
+            config_text=config_text,
+        )
+        config = sender.normalize_config({"db_path": str(self.db.db_path)})
+        self.assertEqual(sender.load_provider(config).api_key, "top-level-secret")
+
+    def test_reserved_provider_ignores_its_section_token(self) -> None:
+        config_text = """model_provider = "OpenAI"
+model = "gpt-test"
+experimental_bearer_token = "top-level-secret"
+
+[model_providers.OpenAI]
+base_url = "https://api.example.test"
+wire_api = "responses"
+experimental_bearer_token = "stale-section-secret"
+"""
+        self.db.add(
+            "provider-a",
+            "Provider A",
+            current=True,
+            key="",
+            config_text=config_text,
+        )
+        config = sender.normalize_config({"db_path": str(self.db.db_path)})
+        self.assertEqual(sender.load_provider(config).api_key, "top-level-secret")
+
+    def test_non_string_config_token_is_rejected(self) -> None:
+        config_text = """model_provider = "custom"
+model = "gpt-test"
+
+[model_providers.custom]
+base_url = "https://api.example.test"
+wire_api = "responses"
+experimental_bearer_token = 123
+"""
+        self.db.add(
+            "provider-a",
+            "Provider A",
+            current=True,
+            key="",
+            config_text=config_text,
+        )
+        config = sender.normalize_config({"db_path": str(self.db.db_path)})
+        with self.assertRaises(sender.SenderError):
+            sender.load_provider(config)
+
+    def test_non_string_model_provider_does_not_select_a_provider_table(self) -> None:
+        config_text = """model_provider = 123
+model = "gpt-test"
+
+[model_providers.123]
+base_url = "https://api.example.test"
+wire_api = "responses"
+experimental_bearer_token = "wrong-section-secret"
+"""
+        self.db.add(
+            "provider-a",
+            "Provider A",
+            current=True,
+            key="",
+            config_text=config_text,
+        )
+        config = sender.normalize_config({"db_path": str(self.db.db_path)})
+        with self.assertRaises(sender.SenderError):
+            sender.load_provider(config)
+
+    def test_managed_placeholders_are_never_treated_as_api_keys(self) -> None:
+        self.db.add(
+            "provider-a",
+            "Provider A",
+            current=True,
+            key="Bearer abc-PROXY_MANAGED-value",
+        )
+        config = sender.normalize_config({"db_path": str(self.db.db_path)})
+
+        catalog = sender.list_codex_providers(config)
+        self.assertFalse(catalog.providers[0].available)
+        self.assertIn("代理托管", catalog.providers[0].unavailable_reason)
+        with self.assertRaisesRegex(sender.SenderError, "代理托管"):
+            sender.load_provider(config)
+
+    def test_official_and_oauth_providers_cannot_bypass_direct_key_gate(self) -> None:
+        self.db.add(
+            "official",
+            "OpenAI Official",
+            current=True,
+            key="stale-secret",
+            category="official",
+        )
+        self.db.add(
+            "xai",
+            "xAI OAuth",
+            key="stale-secret",
+            provider_type="xai_oauth",
+        )
+        self.db.add(
+            "oauth-only",
+            "OAuth Only",
+            key="",
+            config_token="stale-config-secret",
+            auth_extra={"tokens": {"access_token": "oauth-secret"}},
+        )
+
+        for provider_id in ("official", "xai", "oauth-only"):
+            config = sender.normalize_config(
+                {"db_path": str(self.db.db_path), "provider_id": provider_id}
+            )
+            with self.subTest(provider_id=provider_id), self.assertRaises(sender.SenderError):
+                sender.load_provider(config)
+
+    def test_catalog_current_pin_prevents_preview_from_switching_provider(self) -> None:
+        self.db.add("provider-a", "Provider A", current=True, key="key-a")
+        self.db.add("provider-b", "Provider B", current=False, key="")
+        self.db.set_pointer("provider-a")
+        config = sender.normalize_config({"db_path": str(self.db.db_path), "provider_id": "current"})
+        catalog = sender.list_codex_providers(config)
+
+        self.db.set_pointer("provider-b")
+        provider = sender.load_provider(config, current_provider_id=catalog.current_provider_id)
+
+        self.assertEqual(provider.provider_id, "provider-a")
+        self.assertEqual(provider.api_key, "key-a")
 
     def test_non_codex_rows_are_not_listed(self) -> None:
         self.db.add("provider-a", "Provider A", current=True)
@@ -367,7 +737,6 @@ class ProtocolTests(unittest.TestCase):
             codex_version=sender.CodexCliVersion(version="0.144.5", source="test"),
         )
         self.assertNotIn(sender.CODEX_VERSION_HEADER, headers)
-
     def test_send_one_rejects_semantically_wrong_probe_response(self) -> None:
         probe = sender.ProbeCase(prompt="自然任务", expected={"sum": 9, "parity": "odd"})
         config = sender.normalize_config({"random_probe_enabled": True})
@@ -551,6 +920,18 @@ class ProtocolTests(unittest.TestCase):
         self.assertNotIn("secret", json.dumps(data))
 
 
+class GuiGuardTests(unittest.TestCase):
+    def test_start_run_respects_disabled_preview_state_for_hotkey_calls(self) -> None:
+        app = mock.Mock()
+        app.running = False
+        app.blocked_by_unfinished = False
+        app.can_start = False
+
+        sender_ui.BatchSenderApp.start_run(app)
+
+        app._selected_provider_id.assert_not_called()
+
+
 class RunnerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.provider = sender.Provider(
@@ -584,6 +965,35 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(outcome.completed, 4)
         self.assertEqual(outcome.winner.round_no, 2)
         self.assertEqual(len(calls), 4)
+
+    def test_provider_snapshot_is_reused_across_retry_batches(self) -> None:
+        provider_loads: list[str] = []
+
+        def provider_loader(_config):
+            provider_loads.append("load")
+            return self.provider
+
+        def fake_sender(index, provider, config, deadline, logger, abort_polling, *, round_no=1):
+            return sender.AttemptResult(
+                index=index,
+                round_no=round_no,
+                ok=False,
+                status=502,
+                error="bad gateway",
+                provider_name=provider.name,
+            )
+
+        outcome = sender.run_batch(
+            sender.normalize_config(
+                {"request_count": 1, "retry_count": 2, "retry_interval_seconds": 0}
+            ),
+            sender.RunLogger(callback=lambda _line: None),
+            provider_loader=provider_loader,
+            sender=fake_sender,
+        )
+
+        self.assertEqual(outcome.code, 1)
+        self.assertEqual(provider_loads, ["load"])
 
     def test_zero_retries_runs_one_batch(self) -> None:
         calls = 0

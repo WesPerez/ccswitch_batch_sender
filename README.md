@@ -4,7 +4,8 @@
 
 ## 界面能力
 
-- 默认选中 CC Switch 当前 Codex provider；刷新后重新读取当前指针和 provider 列表。
+- 默认选中 CC Switch 当前 Codex provider；刷新和开始运行时重新读取当前指针和 provider 列表。
+- 下拉标签、预览和启动校验使用同一 provider 快照；一次运行（包括额外重试批次）固定使用启动时选定的 provider，不会因 CC Switch 中途切换而漂移。
 - 下拉切换只影响本工具本次发送，不写回 CC Switch，不修改 `cc-switch.db`。
 - 默认由本机官方 Codex CLI 为每个任务发起请求；不伪造 Codex 请求头或客户端元数据。
 - 可切换到“直接 API”模式，以保留完整自定义 JSON、精确 POST 数和原始响应控制。
@@ -12,7 +13,8 @@
 - 可编辑固定提示词、每批请求次数、额外批次重试次数、重试间隔、模型/地址覆盖、超时、Endpoint 模式和输出 token。
 - 官方 CLI 模式展示任务摘要，实际请求头和请求体由 Codex CLI 生成；直接 API 模式展示实际 JSON，并可切换为自定义 JSON。
 - 展示发送上限、批次进度、完成/失败数、首个成功响应、耗时和完整运行日志。
-- 默认不生成 `config.json`、日志文件、结果文件或锁文件。结果和日志只在应用内保留，需要时由用户显式导出。
+- 默认不生成 `config.json`、请求/响应日志、结果文件或锁文件。运行结果和完整请求日志只在应用内保留，需要时由用户显式导出。
+- 默认在 `%LOCALAPPDATA%\CCSwitchBatchSender\logs\provider-diagnostics.jsonl` 保留容量受限的 provider 解析诊断，只记录指针、provider ID、快照状态、凭据来源类型和结果，不记录 API Key、URL、请求体或响应内容。
 - 默认设置保存在当前用户注册表 `HKCU\Software\CCSwitchBatchSender`，不保存 API Key。
 - 使用 Windows 命名互斥体防止重复启动，不产生 `run.lock`。
 
@@ -28,6 +30,8 @@
 - 仅支持 Responses API provider。Chat Completions provider 需使用直接 API 模式。
 
 应用通过单次子进程环境变量向 `codex exec` 提供所选 provider 的 API Key，并通过临时 `-c` 参数覆盖 model 和 base URL。Key 不进入命令行、日志、注册表或配置文件。
+
+凭据读取与 CC Switch 3.18 保持一致：优先使用 `settings_config.auth.OPENAI_API_KEY`，没有时读取 active custom model provider 的 `experimental_bearer_token`，再回退顶层 token。inactive provider section、官方/OAuth provider、`PROXY_MANAGED` 和其他托管占位符不会被当作可直接发送的 API Key。
 
 ### 直接 API
 
@@ -78,6 +82,7 @@ dist\CCSwitchBatchSender.exe
 源码运行：
 
 ```powershell
+python -m pip install -r .\requirements.txt
 python .\ccswitch_batch_sender.py --gui
 ```
 
@@ -85,6 +90,12 @@ python .\ccswitch_batch_sender.py --gui
 
 ```powershell
 python .\ccswitch_batch_sender.py --dry-run
+```
+
+临时关闭 provider 解析诊断日志：
+
+```powershell
+python .\ccswitch_batch_sender.py --gui --no-provider-diagnostics
 ```
 
 无界面发送，并覆盖请求次数、额外重试次数和提示词：
@@ -139,8 +150,11 @@ dist\CCSwitchBatchSender.exe
 ## 安全边界
 
 - 以 SQLite `mode=ro` 和 `PRAGMA query_only=ON` 只读打开 `%USERPROFILE%\.cc-switch\cc-switch.db`。
-- 当前 provider 优先读取 `%USERPROFILE%\.cc-switch\settings.json` 的 `currentProviderCodex`，无有效指针时才回退到数据库唯一的 `is_current=1`。
+- 当前 provider 优先读取 `%USERPROFILE%\.cc-switch\settings.json` 的 `currentProviderCodex`，无有效指针时才回退到数据库唯一的 `is_current=1`；预览与运行会将该结果钉死为具体 provider ID。
+- provider 凭据优先读取 `auth.OPENAI_API_KEY`，并兼容 CC Switch 3.18 的 active-provider/top-level `experimental_bearer_token`；结构化解析 TOML，绝不扫描 inactive section。
+- 官方/OAuth/代理托管凭据和 `PROXY_MANAGED` 等占位符会 fail closed，不会进入 `CODEX_API_KEY`、`Authorization` 或日志。
 - 不显示、不复制、不记录 API Key；注册表设置也不包含 Key。
+- provider 诊断日志按 512 KiB 轮转并保留 2 份备份；字段名包含 Key、Token、Authorization、Password 或 Secret 的数据会被丢弃，写盘失败不影响请求流程。
 - provider 或 CLI 返回内容进入日志和结果前，会再次按当前 API Key 做精确脱敏。
 - provider 下拉只选择本工具的请求来源，不执行 CC Switch 的正式切换操作。
 - 官方 CLI 模式由当前安装的 `codex exec` 发起请求并保留其自动元数据，不伪造任何官方字段。

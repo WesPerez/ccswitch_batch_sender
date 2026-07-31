@@ -22,7 +22,7 @@ try {
         catch {}
 
         foreach ($Candidate in ($Candidates | Select-Object -Unique)) {
-            & $Candidate -c "import PyInstaller, PIL, tkinter" 2>$null
+            & $Candidate -c "import importlib.util, sys, PyInstaller, PIL, tkinter; assert sys.version_info >= (3, 11) or importlib.util.find_spec('tomli')" 2>$null
             if ($LASTEXITCODE -eq 0) {
                 $PythonExe = $Candidate
                 break

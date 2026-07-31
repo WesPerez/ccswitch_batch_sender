@@ -1,2 +1,3 @@
+-r requirements.txt
 PyInstaller>=6.14,<7
 Pillow>=12,<13

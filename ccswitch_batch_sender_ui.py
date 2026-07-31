@@ -23,6 +23,7 @@ from ccswitch_batch_sender import (
     ProgressEvent,
     Provider,
     ProviderCatalog,
+    ProviderDiagnostics,
     ProviderSummary,
     RunLogger,
     RunOutcome,
@@ -147,10 +148,18 @@ class IconStore:
 
 
 class BatchSenderApp:
-    def __init__(self, root: tk.Tk, initial_config: dict[str, Any], *, smoke_ui: bool = False) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        initial_config: dict[str, Any],
+        *,
+        smoke_ui: bool = False,
+        diagnostics: ProviderDiagnostics | None = None,
+    ) -> None:
         self.root = root
         self.base_config = normalize_config(initial_config)
         self.smoke_ui = smoke_ui
+        self.diagnostics = diagnostics
         self.icons = IconStore(root)
         self.stop_event = threading.Event()
         self.running_thread: threading.Thread | None = None
@@ -992,7 +1001,10 @@ class BatchSenderApp:
         if self.running:
             return
         try:
-            self.catalog = list_codex_providers(self.base_config)
+            self.catalog = list_codex_providers(
+                self.base_config,
+                diagnostics=self.diagnostics,
+            )
             self.provider_by_id = {item.provider_id: item for item in self.catalog.providers}
             values: list[str] = []
             mapping: dict[str, str] = {}
@@ -1039,6 +1051,11 @@ class BatchSenderApp:
 
     def _selected_provider_id(self) -> str:
         return self.provider_value_map.get(self.provider_var.get(), "current")
+
+    def _selected_current_provider_pin(self) -> str | None:
+        if self._selected_provider_id() != "current":
+            return None
+        return self.catalog.current_provider_id if self.catalog is not None else ""
 
     def _selected_summary(self) -> ProviderSummary | None:
         provider_id = self._selected_provider_id()
@@ -1098,7 +1115,11 @@ class BatchSenderApp:
             return
         try:
             config = self.collect_config()
-            provider = load_provider(config)
+            provider = load_provider(
+                config,
+                current_provider_id=self._selected_current_provider_pin(),
+                diagnostics=self.diagnostics,
+            )
             self.preview_provider = provider
             cli_mode = config["transport_mode"] == TRANSPORT_CODEX_CLI
             if cli_mode:
@@ -1196,7 +1217,11 @@ class BatchSenderApp:
         if self.custom_body_var.get():
             try:
                 config = self.collect_config()
-                provider = load_provider(config)
+                provider = load_provider(
+                    config,
+                    current_provider_id=self._selected_current_provider_pin(),
+                    diagnostics=self.diagnostics,
+                )
                 if not self.body_text.get("1.0", "end-1c").strip():
                     self._set_body_text(
                         json.dumps(build_preview_body(provider, config), ensure_ascii=False, indent=2),
@@ -1236,8 +1261,15 @@ class BatchSenderApp:
         if self.running or self.blocked_by_unfinished or not self.can_start:
             return
         try:
+            if self._selected_provider_id() == "current":
+                self.refresh_providers(reset_to_current=False)
             config = self.collect_config()
-            load_provider(config)
+            provider = load_provider(
+                config,
+                current_provider_id=self._selected_current_provider_pin(),
+                diagnostics=self.diagnostics,
+            )
+            config["provider_id"] = provider.provider_id
         except SenderError as exc:
             self._show_notice(str(exc).replace("\n", " "), error=True)
             self.schedule_preview()
@@ -1271,6 +1303,7 @@ class BatchSenderApp:
                     stop_event=self.stop_event,
                     on_winner=self.on_winner_threadsafe,
                     on_progress=self.on_progress_threadsafe,
+                    provider_loader=lambda _config: provider,
                 )
                 self.root.after(0, lambda: self.finish_run(outcome))
             except Exception as exc:
@@ -1610,9 +1643,14 @@ class BatchSenderApp:
         self.root.destroy()
 
 
-def launch_gui(initial_config: dict[str, Any], *, smoke_ui: bool = False) -> int:
+def launch_gui(
+    initial_config: dict[str, Any],
+    *,
+    smoke_ui: bool = False,
+    diagnostics: ProviderDiagnostics | None = None,
+) -> int:
     root = tk.Tk()
-    BatchSenderApp(root, initial_config, smoke_ui=smoke_ui)
+    BatchSenderApp(root, initial_config, smoke_ui=smoke_ui, diagnostics=diagnostics)
     try:
         root.mainloop()
     finally:
