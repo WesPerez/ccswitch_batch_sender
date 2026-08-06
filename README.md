@@ -7,8 +7,8 @@
 - 默认选中 CC Switch 当前 Codex provider；刷新和开始运行时重新读取当前指针和 provider 列表。
 - 下拉标签、预览和启动校验使用同一 provider 快照；一次运行（包括额外重试批次）固定使用启动时选定的 provider，不会因 CC Switch 中途切换而漂移。
 - 下拉切换只影响本工具本次发送，不写回 CC Switch，不修改 `cc-switch.db`。
-- 默认由本机官方 Codex CLI 为每个任务发起请求；不伪造 Codex 请求头或客户端元数据。
-- 可切换到“直接 API”模式，以保留完整自定义 JSON、精确 POST 数和原始响应控制。
+- 默认使用“直接 API”模式，以保留完整自定义 JSON、精确 POST 数和原始响应控制。
+- 可切换到本机官方 Codex CLI，由 `codex exec` 为每个任务发起请求；不伪造 Codex 请求头或客户端元数据。
 - 默认让每个任务使用独立的随机内容，也可关闭后改用固定提示词。
 - 可编辑固定提示词、每批请求次数、额外批次重试次数、重试间隔、模型/地址覆盖、超时、Endpoint 模式和输出 token。
 - 官方 CLI 模式展示任务摘要，实际请求头和请求体由 Codex CLI 生成；直接 API 模式展示实际 JSON，并可切换为自定义 JSON。
@@ -20,10 +20,14 @@
 
 ## 请求来源与重试语义
 
-### 官方 Codex CLI（默认）
+### 直接 API（默认）
+
+“请求次数”是每批并发 POST 数；“重试次数”是首批全部失败后额外发送的批次数，不是对每个请求再次重试。
+
+### 官方 Codex CLI
 
 - “请求次数”是每批 Codex 任务数；每个任务由已安装的官方 `codex exec` 独立发起。
-- “CLI 并发”限制同时运行的 Codex 进程数，默认 10，与默认单批任务数一致。
+- “CLI 并发”限制同时运行的 Codex 进程数，默认 10。
 - “重试次数”是整批没有成功结果后额外启动的任务批次数。
 - 一次 Codex 任务内部实际产生多少 HTTP 请求、流式重连或官方重试由 Codex CLI 决定，因此界面不把任务数描述成精确 POST 数。
 - 停止任务或关闭应用时，只终止本应用启动并登记的 Codex CLI 进程树，不影响 Codex Desktop 或其他 Codex 任务。
@@ -31,11 +35,7 @@
 
 应用通过单次子进程环境变量向 `codex exec` 提供所选 provider 的 API Key，并通过临时 `-c` 参数覆盖 model 和 base URL。Key 不进入命令行、日志、注册表或配置文件。
 
-凭据读取与 CC Switch 3.18 保持一致：优先使用 `settings_config.auth.OPENAI_API_KEY`，没有时读取 active custom model provider 的 `experimental_bearer_token`，再回退顶层 token。inactive provider section、官方/OAuth provider、`PROXY_MANAGED` 和其他托管占位符不会被当作可直接发送的 API Key。
-
-### 直接 API
-
-“请求次数”是每批并发 POST 数；“重试次数”是首批全部失败后额外发送的批次数，不是对每个请求再次重试。
+凭据读取与 CC Switch 3.18 保持一致：优先使用 `settings_config.auth.OPENAI_API_KEY`；没有时读取 active custom model provider 的 `experimental_bearer_token`，再回退顶层 token。活动 custom provider 的显式 Key 优先于 CC Switch 为兼容登录保留的 OAuth session；inactive provider section、官方 provider、`xai_oauth`、`PROXY_MANAGED` 和其他托管占位符仍不会被当作可直接发送的 API Key。
 
 最大客户端 POST 数：
 
@@ -43,7 +43,7 @@
 请求次数 × (1 + 重试次数)
 ```
 
-默认请求次数为 10，重试次数为 2，因此最多运行 3 批。直接 API 模式的默认上限是 30 个 POST；官方 CLI 模式的默认上限是 30 个逻辑任务。任意任务成功后不会再开启下一批；官方 CLI 模式会立即终止本应用登记启动的同批其他 Codex 进程树，不影响 Codex Desktop、手动启动的 CLI 或其他 Codex 会话。
+默认请求次数为 15，重试次数为 10，因此最多运行 11 批。直接 API 模式的默认上限是 165 个 POST；官方 CLI 模式的默认上限是 165 个逻辑任务。任意任务成功后不会再开启下一批；官方 CLI 模式会立即终止本应用登记启动的同批其他 Codex 进程树，不影响 Codex Desktop、手动启动的 CLI 或其他 Codex 会话。
 
 终止本地 Codex CLI 任务会关闭它们到 provider/Sub2API 的连接，并可阻止支持请求取消传播的中继继续池重试或换号。关闭本地连接不等于撤销上游请求：已经被中继发送到上游的在途请求仍可能完成并计费，客户端无法撤销已经被上游接受的生成任务。
 
@@ -113,8 +113,8 @@ python .\ccswitch_batch_sender.py --headless --random-tasks
 显式选择请求来源：
 
 ```powershell
-python .\ccswitch_batch_sender.py --headless --transport codex_cli --cli-concurrency 4
 python .\ccswitch_batch_sender.py --headless --transport direct
+python .\ccswitch_batch_sender.py --headless --transport codex_cli --cli-concurrency 10
 ```
 
 成功后显式导出结果：
@@ -151,7 +151,7 @@ dist\CCSwitchBatchSender.exe
 
 - 以 SQLite `mode=ro` 和 `PRAGMA query_only=ON` 只读打开 `%USERPROFILE%\.cc-switch\cc-switch.db`。
 - 当前 provider 优先读取 `%USERPROFILE%\.cc-switch\settings.json` 的 `currentProviderCodex`，无有效指针时才回退到数据库唯一的 `is_current=1`；预览与运行会将该结果钉死为具体 provider ID。
-- provider 凭据优先读取 `auth.OPENAI_API_KEY`，并兼容 CC Switch 3.18 的 active-provider/top-level `experimental_bearer_token`；结构化解析 TOML，绝不扫描 inactive section。
+- provider 凭据优先读取 `auth.OPENAI_API_KEY`，并兼容 CC Switch 3.18 的 active-provider/top-level `experimental_bearer_token`；活动 custom provider 的显式 Key 可覆盖保留的 OAuth session，结构化解析 TOML，绝不扫描 inactive section。
 - 官方/OAuth/代理托管凭据和 `PROXY_MANAGED` 等占位符会 fail closed，不会进入 `CODEX_API_KEY`、`Authorization` 或日志。
 - 不显示、不复制、不记录 API Key；注册表设置也不包含 Key。
 - provider 诊断日志按 512 KiB 轮转并保留 2 份备份；字段名包含 Key、Token、Authorization、Password 或 Secret 的数据会被丢弃，写盘失败不影响请求流程。
