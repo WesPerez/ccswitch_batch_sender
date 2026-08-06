@@ -436,25 +436,6 @@ class BatchSenderApp:
         self._editable_ttk.append(self.provider_combo)
         segments = tk.Frame(provider_band, bg=BORDER, bd=0, padx=1, pady=1)
         segments.grid(row=0, column=2, padx=(8, 0))
-        self.codex_transport_radio = tk.Radiobutton(
-            segments,
-            text="Codex CLI",
-            variable=self.transport_mode_var,
-            value=TRANSPORT_CODEX_CLI,
-            indicatoron=False,
-            command=self._on_transport_changed,
-            bg=SURFACE_SOFT,
-            fg=TEXT,
-            selectcolor=ACCENT_SOFT,
-            activebackground=ACCENT_SOFT,
-            activeforeground=ACCENT,
-            font=FONT_BODY_MEDIUM,
-            relief="flat",
-            bd=0,
-            padx=7,
-            pady=5,
-        )
-        self.codex_transport_radio.grid(row=0, column=0, sticky="nsew")
         self.direct_transport_radio = tk.Radiobutton(
             segments,
             text="直接 API",
@@ -473,7 +454,26 @@ class BatchSenderApp:
             padx=7,
             pady=5,
         )
-        self.direct_transport_radio.grid(row=0, column=1, sticky="nsew", padx=(1, 0))
+        self.direct_transport_radio.grid(row=0, column=0, sticky="nsew")
+        self.codex_transport_radio = tk.Radiobutton(
+            segments,
+            text="Codex CLI",
+            variable=self.transport_mode_var,
+            value=TRANSPORT_CODEX_CLI,
+            indicatoron=False,
+            command=self._on_transport_changed,
+            bg=SURFACE_SOFT,
+            fg=TEXT,
+            selectcolor=ACCENT_SOFT,
+            activebackground=ACCENT_SOFT,
+            activeforeground=ACCENT,
+            font=FONT_BODY_MEDIUM,
+            relief="flat",
+            bd=0,
+            padx=7,
+            pady=5,
+        )
+        self.codex_transport_radio.grid(row=0, column=1, sticky="nsew", padx=(1, 0))
         self.refresh_button = self._tool_button(provider_band, "refresh", self.refresh_providers, "刷新 provider")
         self.refresh_button.grid(row=0, column=3, padx=(8, 0))
         ttk.Label(provider_band, textvariable=self.provider_meta_var, style="Meta.TLabel").grid(

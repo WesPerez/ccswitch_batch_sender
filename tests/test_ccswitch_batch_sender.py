@@ -176,10 +176,10 @@ class ConfigTests(unittest.TestCase):
 
     def test_default_uses_random_real_probes(self) -> None:
         config = sender.normalize_config()
-        self.assertEqual(config["transport_mode"], sender.TRANSPORT_CODEX_CLI)
+        self.assertEqual(config["transport_mode"], sender.TRANSPORT_DIRECT)
         self.assertEqual(config["cli_concurrency"], 10)
-        self.assertEqual(config["request_count"], 10)
-        self.assertEqual(config["retry_count"], 2)
+        self.assertEqual(config["request_count"], 15)
+        self.assertEqual(config["retry_count"], 10)
         self.assertTrue(config["random_probe_enabled"])
         self.assertGreaterEqual(config["max_output_tokens"], 32)
 
@@ -194,10 +194,14 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(migrated["transport_mode"], sender.TRANSPORT_DIRECT)
         self.assertEqual(migrated["cli_concurrency"], 10)
 
+    def test_v2_saved_defaults_use_current_transport(self) -> None:
+        migrated = sender.migrate_saved_config({}, 2)
+        self.assertEqual(migrated["transport_mode"], sender.TRANSPORT_DIRECT)
+
     def test_v3_saved_defaults_migrate_to_new_batch_defaults(self) -> None:
         migrated = sender.migrate_saved_config({"request_count": 20, "retry_count": 0}, 3)
-        self.assertEqual(migrated["request_count"], 10)
-        self.assertEqual(migrated["retry_count"], 2)
+        self.assertEqual(migrated["request_count"], 15)
+        self.assertEqual(migrated["retry_count"], 10)
         self.assertEqual(migrated["cli_concurrency"], 10)
 
     def test_v3_custom_batch_values_are_preserved(self) -> None:
@@ -210,9 +214,27 @@ class ConfigTests(unittest.TestCase):
             {"request_count": 5, "retry_count": 5, "cli_concurrency": 4},
             4,
         )
-        self.assertEqual(migrated["request_count"], 10)
-        self.assertEqual(migrated["retry_count"], 2)
+        self.assertEqual(migrated["request_count"], 15)
+        self.assertEqual(migrated["retry_count"], 10)
         self.assertEqual(migrated["cli_concurrency"], 10)
+
+    def test_v5_saved_defaults_migrate_to_current_batch_defaults(self) -> None:
+        migrated = sender.migrate_saved_config(
+            {"transport_mode": sender.TRANSPORT_CODEX_CLI, "request_count": 10, "retry_count": 2},
+            5,
+        )
+        self.assertEqual(migrated["transport_mode"], sender.TRANSPORT_CODEX_CLI)
+        self.assertEqual(migrated["request_count"], 15)
+        self.assertEqual(migrated["retry_count"], 10)
+
+    def test_v5_custom_batch_values_and_transport_are_preserved(self) -> None:
+        migrated = sender.migrate_saved_config(
+            {"transport_mode": sender.TRANSPORT_CODEX_CLI, "request_count": 8, "retry_count": 2},
+            5,
+        )
+        self.assertEqual(migrated["transport_mode"], sender.TRANSPORT_CODEX_CLI)
+        self.assertEqual(migrated["request_count"], 8)
+        self.assertEqual(migrated["retry_count"], 2)
 
     def test_cli_concurrency_accepts_ten_and_rejects_more(self) -> None:
         self.assertEqual(sender.normalize_config({"cli_concurrency": 10})["cli_concurrency"], 10)
@@ -334,6 +356,27 @@ class ProviderTests(unittest.TestCase):
         )
         config = sender.normalize_config({"db_path": str(self.db.db_path)})
         self.assertEqual(sender.load_provider(config).api_key, "auth-secret")
+
+    def test_active_custom_config_key_wins_over_preserved_oauth_material(self) -> None:
+        self.db.add(
+            "provider-a",
+            "Provider A",
+            current=True,
+            key="",
+            config_token="config-secret",
+            auth_extra={
+                "auth_mode": "chatgpt",
+                "last_refresh": "2026-08-06T00:00:00Z",
+                "tokens": {"access_token": "oauth-secret", "refresh_token": "refresh-secret"},
+            },
+        )
+        config = sender.normalize_config({"db_path": str(self.db.db_path)})
+
+        catalog = sender.list_codex_providers(config)
+        provider = sender.load_provider(config)
+
+        self.assertTrue(catalog.providers[0].available)
+        self.assertEqual(provider.api_key, "config-secret")
 
     def test_bearer_prefixed_auth_key_is_normalized_before_transport_use(self) -> None:
         self.db.add(
@@ -538,6 +581,7 @@ experimental_bearer_token = "wrong-section-secret"
             "Provider A",
             current=True,
             key="Bearer abc-PROXY_MANAGED-value",
+            config_token="must-not-bypass-placeholder",
         )
         config = sender.normalize_config({"db_path": str(self.db.db_path)})
 
@@ -553,19 +597,20 @@ experimental_bearer_token = "wrong-section-secret"
             "OpenAI Official",
             current=True,
             key="stale-secret",
+            config_token="stale-config-secret",
             category="official",
         )
         self.db.add(
             "xai",
             "xAI OAuth",
             key="stale-secret",
+            config_token="stale-config-secret",
             provider_type="xai_oauth",
         )
         self.db.add(
             "oauth-only",
             "OAuth Only",
             key="",
-            config_token="stale-config-secret",
             auth_extra={"tokens": {"access_token": "oauth-secret"}},
         )
 
@@ -1042,7 +1087,13 @@ class RunnerTests(unittest.TestCase):
             raise AssertionError("sender must not be called")
 
         outcome = sender.run_batch(
-            sender.normalize_config({"request_count": 2, "retry_count": 2}),
+            sender.normalize_config(
+                {
+                    "transport_mode": sender.TRANSPORT_CODEX_CLI,
+                    "request_count": 2,
+                    "retry_count": 2,
+                }
+            ),
             sender.RunLogger(callback=lines.append),
             dry_run=True,
             provider_loader=lambda _config: self.provider,

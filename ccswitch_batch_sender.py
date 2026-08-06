@@ -32,7 +32,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 APP_NAME = "CC Switch Batch Sender"
 APP_TITLE = "CC Switch 批量请求"
-APP_VERSION = "2.2.3"
+APP_VERSION = "2.2.4"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".cc-switch" / "cc-switch.db"
 DIAGNOSTIC_LOG_MAX_BYTES = 512 * 1024
@@ -40,7 +40,7 @@ DIAGNOSTIC_LOG_BACKUP_COUNT = 2
 REGISTRY_PATH = r"Software\CCSwitchBatchSender"
 REGISTRY_VALUE = "SettingsJson"
 REGISTRY_SCHEMA_VALUE = "SchemaVersion"
-REGISTRY_SCHEMA_VERSION = 5
+REGISTRY_SCHEMA_VERSION = 6
 MUTEX_NAME = r"Local\CCSwitchBatchSender.App"
 PROMPT_CACHE_KEY_PLACEHOLDER = "<每个请求唯一>"
 RANDOM_TASK_PLACEHOLDER = "<每个请求随机任务>"
@@ -58,15 +58,15 @@ CODEX_RESERVED_MODEL_PROVIDER_IDS = frozenset(
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "transport_mode": TRANSPORT_CODEX_CLI,
+    "transport_mode": TRANSPORT_DIRECT,
     "cli_concurrency": 10,
     "provider_id": "current",
     "model": "",
     "base_url": "",
     "message": DEFAULT_FIXED_MESSAGE,
     "random_probe_enabled": True,
-    "request_count": 10,
-    "retry_count": 2,
+    "request_count": 15,
+    "retry_count": 10,
     "max_output_tokens": 64,
     "request_timeout_seconds": 7200,
     "max_wait_seconds": 7200,
@@ -464,7 +464,7 @@ def normalize_config(values: dict[str, Any] | None = None) -> dict[str, Any]:
         raw.update(values)
 
     config: dict[str, Any] = {
-        "transport_mode": str(raw.get("transport_mode", TRANSPORT_CODEX_CLI)).strip().lower(),
+        "transport_mode": str(raw.get("transport_mode", TRANSPORT_DIRECT)).strip().lower(),
         "cli_concurrency": _coerce_int(raw.get("cli_concurrency"), "CLI 并发数"),
         "provider_id": str(raw.get("provider_id", "current")).strip() or "current",
         "model": str(raw.get("model", "")).strip(),
@@ -548,10 +548,7 @@ def migrate_saved_config(values: dict[str, Any], schema_version: int) -> dict[st
         if migrated.get("max_output_tokens") in {None, 1, "1"}:
             migrated["max_output_tokens"] = DEFAULT_CONFIG["max_output_tokens"]
     if schema_version < 3:
-        migrated.setdefault(
-            "transport_mode",
-            TRANSPORT_DIRECT if bool(migrated.get("custom_body_enabled")) else TRANSPORT_CODEX_CLI,
-        )
+        migrated.setdefault("transport_mode", DEFAULT_CONFIG["transport_mode"])
         migrated.setdefault("cli_concurrency", DEFAULT_CONFIG["cli_concurrency"])
     if schema_version < 4:
         if migrated.get("request_count") in {None, 20, "20"}:
@@ -565,6 +562,13 @@ def migrate_saved_config(values: dict[str, Any], schema_version: int) -> dict[st
             migrated["retry_count"] = DEFAULT_CONFIG["retry_count"]
         if migrated.get("cli_concurrency") in {None, 4, "4"}:
             migrated["cli_concurrency"] = DEFAULT_CONFIG["cli_concurrency"]
+    if schema_version < 6:
+        old_request_default = migrated.get("request_count") in {None, 10, "10"}
+        old_retry_default = migrated.get("retry_count") in {None, 2, "2"}
+        if old_request_default and old_retry_default:
+            migrated["request_count"] = DEFAULT_CONFIG["request_count"]
+            migrated["retry_count"] = DEFAULT_CONFIG["retry_count"]
+        migrated.setdefault("transport_mode", DEFAULT_CONFIG["transport_mode"])
     return migrated
 
 
@@ -724,14 +728,14 @@ def _provider_api_key(
         return api_key, "auth"
     if auth_state == "proxy_managed":
         return "", auth_state
-    if _auth_has_oauth_material(auth):
-        return "", "oauth"
 
     config_key, config_state = _config_experimental_bearer_token(config_blob)
     if config_key:
         return config_key, config_state
     if config_state == "proxy_managed":
         return "", config_state
+    if _auth_has_oauth_material(auth):
+        return "", "oauth"
     return "", "none"
 
 
@@ -2464,8 +2468,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, help="可选的临时 JSON 配置；默认不需要配置文件")
     parser.add_argument(
         "--transport",
-        choices=[TRANSPORT_CODEX_CLI, TRANSPORT_DIRECT],
-        help="请求来源：codex_cli 使用官方 Codex CLI；direct 使用直接 API",
+        choices=[TRANSPORT_DIRECT, TRANSPORT_CODEX_CLI],
+        help="请求来源：direct 使用直接 API；codex_cli 使用官方 Codex CLI",
     )
     parser.add_argument("--cli-concurrency", type=int, help="官方 Codex CLI 模式的最大并发任务数")
     parser.add_argument("--count", type=int, help="覆盖每批请求次数")
