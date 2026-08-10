@@ -76,6 +76,14 @@ ENDPOINT_LABELS = {
 ENDPOINT_VALUES = {value: label for label, value in ENDPOINT_LABELS.items()}
 
 
+def _default_provider_id(catalog: ProviderCatalog) -> str:
+    """Prefer the first provider whose name contains ``any``; otherwise use current."""
+    for summary in catalog.providers:
+        if "any" in summary.name.casefold():
+            return summary.provider_id
+    return catalog.current_provider_id
+
+
 class Tooltip:
     def __init__(self, widget: tk.Widget, text: str) -> None:
         self.widget = widget
@@ -1028,7 +1036,20 @@ class BatchSenderApp:
             self.provider_value_map = mapping
             self.provider_combo.configure(values=values)
             if reset_to_current or self.provider_var.get() not in mapping:
-                self.provider_var.set(values[0])
+                default_provider_id = _default_provider_id(self.catalog)
+                default_value = next(
+                    (
+                        label
+                        for label, mapped_id in mapping.items()
+                        if mapped_id == default_provider_id
+                        or (
+                            mapped_id == "current"
+                            and default_provider_id == self.catalog.current_provider_id
+                        )
+                    ),
+                    values[0],
+                )
+                self.provider_var.set(default_value)
             self._show_notice(f"已读取 {len(self.catalog.providers)} 个 provider")
             self.schedule_preview()
         except SenderError as exc:

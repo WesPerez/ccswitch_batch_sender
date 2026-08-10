@@ -180,6 +180,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config["cli_concurrency"], 10)
         self.assertEqual(config["request_count"], 15)
         self.assertEqual(config["retry_count"], 10)
+        self.assertEqual(config["request_timeout_seconds"], 10)
+        self.assertEqual(config["max_wait_seconds"], 7200)
         self.assertTrue(config["random_probe_enabled"])
         self.assertGreaterEqual(config["max_output_tokens"], 32)
 
@@ -235,6 +237,14 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(migrated["transport_mode"], sender.TRANSPORT_CODEX_CLI)
         self.assertEqual(migrated["request_count"], 8)
         self.assertEqual(migrated["retry_count"], 2)
+
+    def test_v6_saved_default_request_timeout_is_shortened(self) -> None:
+        migrated = sender.migrate_saved_config({"request_timeout_seconds": 7200}, 6)
+        self.assertEqual(migrated["request_timeout_seconds"], 10)
+
+    def test_v6_custom_request_timeout_is_preserved(self) -> None:
+        migrated = sender.migrate_saved_config({"request_timeout_seconds": 300}, 6)
+        self.assertEqual(migrated["request_timeout_seconds"], 300)
 
     def test_cli_concurrency_accepts_ten_and_rejects_more(self) -> None:
         self.assertEqual(sender.normalize_config({"cli_concurrency": 10})["cli_concurrency"], 10)
@@ -966,6 +976,39 @@ class ProtocolTests(unittest.TestCase):
 
 
 class GuiGuardTests(unittest.TestCase):
+    @staticmethod
+    def _summary(provider_id: str, name: str) -> sender.ProviderSummary:
+        return sender.ProviderSummary(
+            provider_id=provider_id,
+            name=name,
+            is_current=False,
+            model="gpt-test",
+            base_url="https://api.example.test",
+            api_format="openai_responses",
+            has_api_key=True,
+            available=True,
+        )
+
+    def test_default_provider_prefers_first_name_containing_any(self) -> None:
+        catalog = sender.ProviderCatalog(
+            current_provider_id="provider-current",
+            providers=(
+                self._summary("provider-any-1", "Primary Any"),
+                self._summary("provider-any-2", "Backup ANY"),
+                self._summary("provider-current", "Current"),
+            ),
+        )
+
+        self.assertEqual(sender_ui._default_provider_id(catalog), "provider-any-1")
+
+    def test_default_provider_falls_back_to_current_without_any_name(self) -> None:
+        catalog = sender.ProviderCatalog(
+            current_provider_id="provider-current",
+            providers=(self._summary("provider-current", "Current"),),
+        )
+
+        self.assertEqual(sender_ui._default_provider_id(catalog), "provider-current")
+
     def test_start_run_respects_disabled_preview_state_for_hotkey_calls(self) -> None:
         app = mock.Mock()
         app.running = False

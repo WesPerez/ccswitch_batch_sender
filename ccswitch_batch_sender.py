@@ -32,7 +32,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 APP_NAME = "CC Switch Batch Sender"
 APP_TITLE = "CC Switch 批量请求"
-APP_VERSION = "2.2.4"
+APP_VERSION = "2.2.5"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".cc-switch" / "cc-switch.db"
 DIAGNOSTIC_LOG_MAX_BYTES = 512 * 1024
@@ -40,7 +40,7 @@ DIAGNOSTIC_LOG_BACKUP_COUNT = 2
 REGISTRY_PATH = r"Software\CCSwitchBatchSender"
 REGISTRY_VALUE = "SettingsJson"
 REGISTRY_SCHEMA_VALUE = "SchemaVersion"
-REGISTRY_SCHEMA_VERSION = 6
+REGISTRY_SCHEMA_VERSION = 7
 MUTEX_NAME = r"Local\CCSwitchBatchSender.App"
 PROMPT_CACHE_KEY_PLACEHOLDER = "<每个请求唯一>"
 RANDOM_TASK_PLACEHOLDER = "<每个请求随机任务>"
@@ -68,7 +68,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "request_count": 15,
     "retry_count": 10,
     "max_output_tokens": 64,
-    "request_timeout_seconds": 7200,
+    "request_timeout_seconds": 10,
     "max_wait_seconds": 7200,
     "retry_interval_seconds": 3,
     "poll_interval_seconds": 2,
@@ -569,6 +569,13 @@ def migrate_saved_config(values: dict[str, Any], schema_version: int) -> dict[st
             migrated["request_count"] = DEFAULT_CONFIG["request_count"]
             migrated["retry_count"] = DEFAULT_CONFIG["retry_count"]
         migrated.setdefault("transport_mode", DEFAULT_CONFIG["transport_mode"])
+    if schema_version < 7 and migrated.get("request_timeout_seconds") in {
+        None,
+        7200,
+        "7200",
+        "7200.0",
+    }:
+        migrated["request_timeout_seconds"] = DEFAULT_CONFIG["request_timeout_seconds"]
     return migrated
 
 
