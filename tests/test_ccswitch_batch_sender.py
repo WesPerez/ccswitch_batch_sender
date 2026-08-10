@@ -174,14 +174,25 @@ class ConfigTests(unittest.TestCase):
         config = sender.normalize_config({"request_count": 7, "retry_count": 2})
         self.assertEqual(config["request_count"] * (1 + config["retry_count"]), 21)
 
+    def test_retry_count_accepts_finite_values_above_ten(self) -> None:
+        self.assertEqual(sender.normalize_config({"retry_count": 25})["retry_count"], 25)
+        self.assertEqual(
+            sender.normalize_config({"retry_count": sender.MAX_FINITE_RETRY_COUNT})["retry_count"],
+            sender.MAX_FINITE_RETRY_COUNT,
+        )
+        with self.assertRaises(sender.SenderError):
+            sender.normalize_config({"retry_count": -1})
+        with self.assertRaises(sender.SenderError):
+            sender.normalize_config({"retry_count": sender.MAX_FINITE_RETRY_COUNT + 1})
+
     def test_default_uses_random_real_probes(self) -> None:
         config = sender.normalize_config()
         self.assertEqual(config["transport_mode"], sender.TRANSPORT_DIRECT)
         self.assertEqual(config["cli_concurrency"], 10)
         self.assertEqual(config["request_count"], 15)
-        self.assertEqual(config["retry_count"], 10)
+        self.assertEqual(config["retry_count"], 0)
         self.assertEqual(config["request_timeout_seconds"], 10)
-        self.assertEqual(config["max_wait_seconds"], 7200)
+        self.assertEqual(config["max_wait_seconds"], 0)
         self.assertTrue(config["random_probe_enabled"])
         self.assertGreaterEqual(config["max_output_tokens"], 32)
 
@@ -203,7 +214,7 @@ class ConfigTests(unittest.TestCase):
     def test_v3_saved_defaults_migrate_to_new_batch_defaults(self) -> None:
         migrated = sender.migrate_saved_config({"request_count": 20, "retry_count": 0}, 3)
         self.assertEqual(migrated["request_count"], 15)
-        self.assertEqual(migrated["retry_count"], 10)
+        self.assertEqual(migrated["retry_count"], 0)
         self.assertEqual(migrated["cli_concurrency"], 10)
 
     def test_v3_custom_batch_values_are_preserved(self) -> None:
@@ -217,7 +228,7 @@ class ConfigTests(unittest.TestCase):
             4,
         )
         self.assertEqual(migrated["request_count"], 15)
-        self.assertEqual(migrated["retry_count"], 10)
+        self.assertEqual(migrated["retry_count"], 0)
         self.assertEqual(migrated["cli_concurrency"], 10)
 
     def test_v5_saved_defaults_migrate_to_current_batch_defaults(self) -> None:
@@ -227,7 +238,7 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertEqual(migrated["transport_mode"], sender.TRANSPORT_CODEX_CLI)
         self.assertEqual(migrated["request_count"], 15)
-        self.assertEqual(migrated["retry_count"], 10)
+        self.assertEqual(migrated["retry_count"], 0)
 
     def test_v5_custom_batch_values_and_transport_are_preserved(self) -> None:
         migrated = sender.migrate_saved_config(
@@ -267,7 +278,106 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn("provider_id", payload)
         self.assertNotIn("db_path", payload)
         self.assertNotIn("user_agent", payload)
+        self.assertNotIn("originator", payload)
+        self.assertNotIn("send_codex_version_header", payload)
         self.assertNotIn("api_key", json.dumps(payload))
+
+    def test_saved_config_uses_readable_versioned_json_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ccswitch-config-test-") as temp:
+            path = Path(temp) / "settings.json"
+            config = sender.normalize_config({"retry_count": 25, "retry_interval_seconds": 7})
+
+            sender.save_saved_config(config, path=path)
+
+            document = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(document["schema_version"], sender.CONFIG_SCHEMA_VERSION)
+            self.assertEqual(document["settings"]["retry_count"], 25)
+            self.assertEqual(sender.load_saved_config(path=path)["retry_interval_seconds"], 7)
+            self.assertEqual(sender.load_json_config(path)["retry_count"], 25)
+
+    def test_legacy_registry_config_is_saved_before_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ccswitch-config-migration-") as temp:
+            path = Path(temp) / "settings.json"
+            legacy = sender.normalize_config({"retry_count": 2})
+            with (
+                mock.patch.object(sender, "default_saved_config_path", return_value=path),
+                mock.patch.object(sender, "_load_legacy_registry_config", return_value=legacy),
+                mock.patch.object(sender, "_delete_legacy_registry_config", return_value=True) as delete,
+            ):
+                loaded = sender.load_saved_config()
+
+            self.assertEqual(loaded["retry_count"], 2)
+            self.assertTrue(path.exists())
+            delete.assert_called_once_with()
+
+    def test_legacy_registry_is_not_deleted_when_file_write_fails(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ccswitch-config-migration-") as temp:
+            path = Path(temp) / "settings.json"
+            legacy = sender.normalize_config({"retry_count": 2})
+            with (
+                mock.patch.object(sender, "default_saved_config_path", return_value=path),
+                mock.patch.object(sender, "_load_legacy_registry_config", return_value=legacy),
+                mock.patch.object(sender, "save_saved_config", side_effect=OSError("disk full")),
+                mock.patch.object(sender, "_delete_legacy_registry_config") as delete,
+            ):
+                loaded = sender.load_saved_config()
+
+            self.assertEqual(loaded["retry_count"], 2)
+            delete.assert_not_called()
+
+    def test_invalid_saved_file_falls_back_to_registry_without_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ccswitch-config-invalid-") as temp:
+            path = Path(temp) / "settings.json"
+            path.write_text("{invalid", encoding="utf-8")
+            legacy = sender.normalize_config({"retry_count": 3})
+            with (
+                mock.patch.object(sender, "default_saved_config_path", return_value=path),
+                mock.patch.object(sender, "_load_legacy_registry_config", return_value=legacy),
+                mock.patch.object(sender, "save_saved_config") as save,
+                mock.patch.object(sender, "_delete_legacy_registry_config") as delete,
+            ):
+                loaded = sender.load_saved_config()
+
+            self.assertEqual(loaded["retry_count"], 3)
+            save.assert_not_called()
+            delete.assert_not_called()
+
+    def test_invalid_cli_config_does_not_trigger_saved_config_migration(self) -> None:
+        mutex = mock.Mock()
+        mutex.acquire.return_value = True
+        with (
+            mock.patch.object(sender, "SingleInstanceMutex", return_value=mutex),
+            mock.patch.object(sender, "load_json_config", side_effect=sender.SenderError("bad config")),
+            mock.patch.object(sender, "load_saved_config") as load_saved,
+            mock.patch.object(sender, "terminate_active_codex_processes"),
+            mock.patch.object(sender, "_console_print"),
+        ):
+            code = sender.main(["--headless", "--config", "bad.json"])
+
+        self.assertEqual(code, 2)
+        load_saved.assert_not_called()
+        mutex.release.assert_called_once_with()
+
+    def test_v7_default_limits_migrate_to_unlimited(self) -> None:
+        migrated = sender.migrate_saved_config(
+            {"retry_count": 10, "max_wait_seconds": 7200},
+            7,
+        )
+        self.assertEqual(migrated["retry_count"], 0)
+        self.assertEqual(migrated["max_wait_seconds"], 0)
+
+    def test_v6_saved_identity_overrides_are_removed(self) -> None:
+        migrated = sender.migrate_saved_config(
+            {
+                "user_agent": "legacy-agent",
+                "originator": "legacy-originator",
+                "send_codex_version_header": False,
+            },
+            6,
+        )
+        self.assertNotIn("user_agent", migrated)
+        self.assertNotIn("originator", migrated)
+        self.assertNotIn("send_codex_version_header", migrated)
 
     @unittest.skipUnless(os.name == "nt", "Windows named mutex")
     def test_named_mutex_prevents_a_second_instance(self) -> None:
@@ -774,24 +884,46 @@ class ProtocolTests(unittest.TestCase):
         invalid, _ = sender.validate_probe_response("{}", probe)
         self.assertFalse(invalid)
 
-    def test_request_headers_report_codex_version_without_impersonating_codex(self) -> None:
+    def test_request_headers_use_captured_codex_exec_compatibility_identity(self) -> None:
         headers = sender.build_request_headers(
             self.provider,
             sender.normalize_config(),
-            codex_version=sender.CodexCliVersion(version="0.144.5", source="test"),
+            codex_version=sender.CodexCliVersion(version="0.146.0", source="test"),
         )
-        self.assertEqual(headers[sender.CODEX_VERSION_HEADER], "0.144.5")
-        self.assertIn("non-codex", headers["User-Agent"])
-        self.assertNotIn("codex_cli_rs", json.dumps(headers))
+        expected_user_agent = sender.build_codex_compatibility_user_agent(
+            sender.CodexCliVersion(version="0.146.0", source="test"),
+            windows_version="10.0.26200",
+            machine="AMD64",
+        )
+        self.assertEqual(
+            expected_user_agent,
+            "codex_exec/0.146.0 (Windows 10.0.26200; x86_64) unknown (codex_exec; 0.146.0)",
+        )
+        self.assertTrue(headers["User-Agent"].startswith("codex_exec/0.146.0 (Windows "))
+        self.assertEqual(headers["Originator"], "codex_exec")
+        self.assertNotIn("CC Switch", json.dumps(headers))
+        self.assertFalse(any(name.lower().startswith("x-ccswitch-") for name in headers))
 
-    def test_codex_version_header_can_be_disabled(self) -> None:
-        config = sender.normalize_config({"send_codex_version_header": False})
+    def test_legacy_identity_overrides_cannot_change_compatibility_headers(self) -> None:
+        config = sender.normalize_config(
+            {
+                "user_agent": "legacy-agent",
+                "originator": "legacy-originator",
+                "send_codex_version_header": False,
+            }
+        )
         headers = sender.build_request_headers(
             self.provider,
             config,
-            codex_version=sender.CodexCliVersion(version="0.144.5", source="test"),
+            codex_version=sender.CodexCliVersion(version="0.146.0", source="test"),
         )
-        self.assertNotIn(sender.CODEX_VERSION_HEADER, headers)
+        self.assertNotIn("user_agent", config)
+        self.assertNotIn("originator", config)
+        self.assertNotIn("send_codex_version_header", config)
+        self.assertEqual(headers["Originator"], "codex_exec")
+        self.assertTrue(headers["User-Agent"].startswith("codex_exec/0.146.0 (Windows "))
+        self.assertFalse(any(name.lower().startswith("x-ccswitch-") for name in headers))
+
     def test_send_one_rejects_semantically_wrong_probe_response(self) -> None:
         probe = sender.ProbeCase(prompt="自然任务", expected={"sum": 9, "parity": "odd"})
         config = sender.normalize_config({"random_probe_enabled": True})
@@ -1083,25 +1215,53 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(outcome.code, 1)
         self.assertEqual(provider_loads, ["load"])
 
-    def test_zero_retries_runs_one_batch(self) -> None:
-        calls = 0
-        lock = threading.Lock()
+    def test_zero_retries_runs_until_success(self) -> None:
+        calls: list[int] = []
+        progress: list[sender.ProgressEvent] = []
 
         def fake_sender(index, provider, config, deadline, logger, abort_polling, *, round_no=1):
-            nonlocal calls
-            with lock:
-                calls += 1
+            calls.append(round_no)
+            if round_no == 3:
+                return sender.AttemptResult(index=index, round_no=round_no, ok=True, status=200, text="ok")
             return sender.AttemptResult(index=index, round_no=round_no, ok=False, status=502, error="bad gateway")
 
         outcome = sender.run_batch(
-            sender.normalize_config({"request_count": 3, "retry_count": 0}),
+            sender.normalize_config(
+                {"request_count": 1, "retry_count": 0, "retry_interval_seconds": 0}
+            ),
             sender.RunLogger(callback=lambda _line: None),
+            on_progress=progress.append,
             provider_loader=lambda _config: self.provider,
             sender=fake_sender,
         )
-        self.assertEqual(outcome.code, 1)
+        self.assertEqual(outcome.code, 0)
         self.assertEqual(outcome.launched, 3)
-        self.assertEqual(calls, 3)
+        self.assertEqual(calls, [1, 2, 3])
+        self.assertTrue(all(event.max_rounds == 0 for event in progress))
+        self.assertTrue(all(event.total_cap == 0 for event in progress))
+
+    def test_unlimited_retries_stop_on_user_request(self) -> None:
+        stop_event = threading.Event()
+        calls: list[int] = []
+
+        def fake_sender(index, provider, config, deadline, logger, abort_polling, *, round_no=1):
+            calls.append(round_no)
+            if round_no == 2:
+                stop_event.set()
+            return sender.AttemptResult(index=index, round_no=round_no, ok=False, status=502, error="bad gateway")
+
+        outcome = sender.run_batch(
+            sender.normalize_config(
+                {"request_count": 1, "retry_count": 0, "retry_interval_seconds": 0}
+            ),
+            sender.RunLogger(callback=lambda _line: None),
+            stop_event=stop_event,
+            provider_loader=lambda _config: self.provider,
+            sender=fake_sender,
+        )
+
+        self.assertEqual(outcome.code, 130)
+        self.assertEqual(calls, [1, 2])
 
     def test_non_retryable_batch_stops_before_configured_retries(self) -> None:
         calls = 0
@@ -1114,7 +1274,7 @@ class RunnerTests(unittest.TestCase):
             return sender.AttemptResult(index=index, round_no=round_no, ok=False, status=401, error="unauthorized")
 
         outcome = sender.run_batch(
-            sender.normalize_config({"request_count": 2, "retry_count": 3, "retry_interval_seconds": 0}),
+            sender.normalize_config({"request_count": 2, "retry_count": 0, "retry_interval_seconds": 0}),
             sender.RunLogger(callback=lambda _line: None),
             provider_loader=lambda _config: self.provider,
             sender=fake_sender,
@@ -1151,7 +1311,7 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("third-party", run_start)
         self.assertNotIn("random-probe", run_start)
 
-    def test_direct_transport_keeps_transparent_client_identity(self) -> None:
+    def test_direct_transport_logs_codex_compatibility_simulation(self) -> None:
         lines: list[str] = []
         outcome = sender.run_batch(
             sender.normalize_config(
@@ -1169,8 +1329,9 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(outcome.code, 0)
         run_start = next(line for line in lines if "RUN_START" in line)
         self.assertIn("transport=direct-api", run_start)
-        self.assertIn("client=ccswitch-batch-sender", run_start)
-        self.assertIn("post_cap=1", run_start)
+        self.assertIn("client=codex-compatibility-simulation", run_start)
+        self.assertIn("originator=codex_exec", run_start)
+        self.assertIn("post_cap=unlimited", run_start)
 
     def test_runner_redacts_provider_key_before_logging(self) -> None:
         lines: list[str] = []
@@ -1191,7 +1352,7 @@ class RunnerTests(unittest.TestCase):
                 {
                     "transport_mode": sender.TRANSPORT_DIRECT,
                     "request_count": 1,
-                    "retry_count": 0,
+                    "retry_count": 1,
                 }
             ),
             sender.RunLogger(callback=lines.append),

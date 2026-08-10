@@ -116,6 +116,23 @@ def trash_2(draw: ImageDraw.ImageDraw, size: int, color: tuple[int, int, int, in
     line(draw, size, [(14, 11), (14, 17)], color)
 
 
+def sliders_horizontal(draw: ImageDraw.ImageDraw, size: int, color: tuple[int, int, int, int]) -> None:
+    line(draw, size, [(3, 4), (10, 4)], color)
+    line(draw, size, [(14, 4), (21, 4)], color)
+    line(draw, size, [(14, 2), (14, 6)], color)
+    line(draw, size, [(3, 12), (8, 12)], color)
+    line(draw, size, [(12, 12), (21, 12)], color)
+    line(draw, size, [(8, 10), (8, 14)], color)
+    line(draw, size, [(3, 20), (12, 20)], color)
+    line(draw, size, [(16, 20), (21, 20)], color)
+    line(draw, size, [(16, 18), (16, 22)], color)
+
+
+def folder_open(draw: ImageDraw.ImageDraw, size: int, color: tuple[int, int, int, int]) -> None:
+    line(draw, size, [(3, 19), (3, 6), (9, 6), (11, 8), (21, 8), (21, 11)], color)
+    line(draw, size, [(3, 19), (6.5, 11), (21, 11), (17.5, 19), (3, 19)], color)
+
+
 def save_icon(name: str, painter: Callable[[ImageDraw.ImageDraw, int, tuple[int, int, int, int]], None], color: tuple[int, int, int, int]) -> None:
     render(painter, color).save(ASSETS / name, optimize=True)
 
@@ -147,6 +164,8 @@ def main() -> None:
     save_icon("download-dark.png", download, INK)
     save_icon("rotate-ccw-dark.png", rotate_ccw, INK)
     save_icon("trash-2-dark.png", trash_2, INK)
+    save_icon("settings-dark.png", sliders_horizontal, INK)
+    save_icon("folder-open-dark.png", folder_open, INK)
     build_app_icon()
 
 

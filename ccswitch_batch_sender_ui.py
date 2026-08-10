@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
+import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -13,8 +16,10 @@ from tkinter import filedialog, messagebox, ttk
 
 from ccswitch_batch_sender import (
     APP_TITLE,
+    DEFAULT_DB_PATH,
     DEFAULT_CONFIG,
     LEGACY_RANDOM_PROBE_PLACEHOLDER,
+    MAX_FINITE_RETRY_COUNT,
     PROMPT_CACHE_KEY_PLACEHOLDER,
     RANDOM_TASK_PLACEHOLDER,
     TRANSPORT_CODEX_CLI,
@@ -31,6 +36,9 @@ from ccswitch_batch_sender import (
     build_preview_body,
     build_result_dict,
     detect_codex_cli_version,
+    default_app_data_dir,
+    default_provider_diagnostics_path,
+    default_saved_config_path,
     endpoint_candidates,
     list_codex_providers,
     load_provider,
@@ -141,6 +149,8 @@ class IconStore:
         "download": "assets/download-dark.png",
         "reset": "assets/rotate-ccw-dark.png",
         "clear": "assets/trash-2-dark.png",
+        "settings": "assets/settings-dark.png",
+        "folder": "assets/folder-open-dark.png",
     }
 
     def __init__(self, root: tk.Tk) -> None:
@@ -185,6 +195,7 @@ class BatchSenderApp:
         self.provider_by_id: dict[str, ProviderSummary] = {}
         self.provider_value_map: dict[str, str] = {}
         self.preview_provider: Provider | None = None
+        self.settings_window: tk.Toplevel | None = None
         self._editable_ttk: list[ttk.Widget] = []
 
         self._init_window()
@@ -392,7 +403,6 @@ class BatchSenderApp:
         self.max_wait_var = tk.StringVar()
         self.poll_interval_var = tk.StringVar()
         self.unique_cache_var = tk.BooleanVar()
-        self.send_codex_version_var = tk.BooleanVar()
         self.save_full_response_var = tk.BooleanVar()
         self.custom_body_var = tk.BooleanVar()
         self.body_mode_var = tk.StringVar(value="自动生成 · 只读")
@@ -554,8 +564,15 @@ class BatchSenderApp:
         ttk.Label(action_bar, textvariable=self.notice_var, style="App.TLabel").grid(
             row=0, column=3, sticky="e", padx=(12, 8)
         )
+        self.settings_button = self._tool_button(
+            action_bar,
+            "settings",
+            self.open_settings,
+            "应用设置与配置位置",
+        )
+        self.settings_button.grid(row=0, column=4, sticky="e", padx=(0, 6))
         self.reset_button = self._tool_button(action_bar, "reset", self.reset_defaults, "恢复默认设置")
-        self.reset_button.grid(row=0, column=4, sticky="e")
+        self.reset_button.grid(row=0, column=5, sticky="e")
 
     def _build_common_settings(self, parent: ttk.Frame) -> None:
         parent.grid_columnconfigure(0, weight=1)
@@ -608,10 +625,10 @@ class BatchSenderApp:
         self.retry_count_spin = self._spin_field(
             numeric,
             1,
-            "重试次数",
+            "重试（0=无限）",
             self.retry_count_var,
             0,
-            10,
+            MAX_FINITE_RETRY_COUNT,
         )
         self.retry_interval_spin = self._spin_field(
             numeric,
@@ -662,14 +679,6 @@ class BatchSenderApp:
         )
         self.full_response_check.grid(row=0, column=2, sticky="e", padx=(8, 0))
         Tooltip(self.full_response_check, "导出结果时包含完整响应")
-        self.codex_version_check = self._checkbutton(
-            options_line,
-            "Codex 版本",
-            self.send_codex_version_var,
-            compact=True,
-        )
-        self.codex_version_check.grid(row=0, column=3, sticky="e", padx=(8, 0))
-        Tooltip(self.codex_version_check, "向 provider 附带本机 Codex CLI 版本请求头")
         self.base_url_entry = ttk.Entry(parent, textvariable=self.base_url_override_var)
         self.base_url_entry.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(3, 5))
 
@@ -688,19 +697,21 @@ class BatchSenderApp:
         self.request_timeout_spin = self._spin_field(
             timing,
             1,
-            "单次超时（秒）",
+            "单次超时",
             self.request_timeout_var,
             1,
             86400,
         )
+        Tooltip(self.request_timeout_spin, "单位：秒")
         self.max_wait_spin = self._spin_field(
             timing,
             2,
-            "总等待（秒）",
+            "总等待",
             self.max_wait_var,
             0,
             86400,
         )
+        Tooltip(self.max_wait_spin, "单位：秒；0 表示无限等待")
         self.cli_concurrency_spin = self._spin_field(
             timing,
             3,
@@ -721,7 +732,6 @@ class BatchSenderApp:
                 self.cli_concurrency_spin,
                 self.unique_check,
                 self.full_response_check,
-                self.codex_version_check,
             ]
         )
 
@@ -958,7 +968,6 @@ class BatchSenderApp:
         ):
             variable.trace_add("write", lambda *_args: self.schedule_preview())
         self.unique_cache_var.trace_add("write", lambda *_args: self.schedule_preview())
-        self.send_codex_version_var.trace_add("write", lambda *_args: self.schedule_preview())
         self.save_full_response_var.trace_add("write", lambda *_args: self.schedule_preview())
         self.random_probe_var.trace_add("write", lambda *_args: self.schedule_preview())
         self.root.bind("<Control-Return>", lambda _event: self.start_run())
@@ -983,7 +992,6 @@ class BatchSenderApp:
         self.max_wait_var.set(self._number_text(config["max_wait_seconds"]))
         self.poll_interval_var.set(self._number_text(config["poll_interval_seconds"]))
         self.unique_cache_var.set(bool(config["unique_prompt_cache_key"]))
-        self.send_codex_version_var.set(bool(config["send_codex_version_header"]))
         self.save_full_response_var.set(bool(config["save_full_response"]))
         self.custom_body_var.set(bool(config["custom_body_enabled"]))
         if self.custom_body_var.get() and isinstance(config.get("custom_body"), dict):
@@ -1114,7 +1122,12 @@ class BatchSenderApp:
         self.codex_transport_radio.configure(state=radio_state)
         self.direct_transport_radio.configure(state=radio_state)
 
-        for widget in (self.max_tokens_spin, self.unique_check, self.codex_version_check, self.custom_body_check, self.body_reset_button):
+        for widget in (
+            self.max_tokens_spin,
+            self.unique_check,
+            self.custom_body_check,
+            self.body_reset_button,
+        ):
             widget.state(["!disabled"] if editable and not cli_mode else ["disabled"])
         self.cli_concurrency_spin.state(["!disabled"] if editable and cli_mode else ["disabled"])
         if cli_mode:
@@ -1191,7 +1204,7 @@ class BatchSenderApp:
             self.can_start = False
             self._refresh_start_state()
 
-    def collect_config(self) -> dict[str, Any]:
+    def collect_config(self, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         data = dict(self.base_config)
         data.update(
             {
@@ -1211,7 +1224,6 @@ class BatchSenderApp:
                 "poll_interval_seconds": self.poll_interval_var.get(),
                 "endpoint_style": ENDPOINT_LABELS.get(self.endpoint_style_var.get(), "auto"),
                 "unique_prompt_cache_key": self.unique_cache_var.get(),
-                "send_codex_version_header": self.send_codex_version_var.get(),
                 "save_full_response": self.save_full_response_var.get(),
                 "custom_body_enabled": self.custom_body_var.get()
                 and self.transport_mode_var.get() == TRANSPORT_DIRECT,
@@ -1225,6 +1237,8 @@ class BatchSenderApp:
                 raise SenderError(f"自定义请求体 JSON 错误：第 {exc.lineno} 行第 {exc.colno} 列。") from exc
         else:
             data["custom_body"] = None
+        if overrides:
+            data.update(overrides)
         return normalize_config(data)
 
     def toggle_custom_body(self) -> None:
@@ -1266,13 +1280,22 @@ class BatchSenderApp:
         try:
             count = int(self.request_count_var.get())
             retries = int(self.retry_count_var.get())
-            cap = count * (1 + retries)
+            if retries < 0:
+                raise ValueError
             if self.transport_mode_var.get() == TRANSPORT_CODEX_CLI:
                 concurrency = int(self.cli_concurrency_var.get())
-                self.limit_var.set(f"上限 {cap} 个任务 · CLI 并发 {concurrency}")
+                if retries == 0:
+                    self.limit_var.set(f"无限批次 · 直到成功或手动停止 · CLI 并发 {concurrency}")
+                else:
+                    cap = count * (1 + retries)
+                    self.limit_var.set(f"上限 {cap} 个任务 · CLI 并发 {concurrency}")
                 button_text = f"运行 {count} 个任务"
             else:
-                self.limit_var.set(f"上限 {cap} 个 POST")
+                if retries == 0:
+                    self.limit_var.set("无限批次 · 直到成功或手动停止")
+                else:
+                    cap = count * (1 + retries)
+                    self.limit_var.set(f"上限 {cap} 个 POST")
                 button_text = f"发送 {count} 个"
             self.start_button.configure(text=button_text) if hasattr(self, "start_button") else None
         except (TypeError, ValueError):
@@ -1301,7 +1324,12 @@ class BatchSenderApp:
         self.latest_result = None
         self.last_run_config = config
         self.run_started_at = time.monotonic()
-        self.progressbar.configure(maximum=int(config["request_count"]) * (1 + int(config["retry_count"])), value=0)
+        progress_maximum = (
+            int(config["request_count"])
+            if int(config["retry_count"]) == 0
+            else int(config["request_count"]) * (1 + int(config["retry_count"]))
+        )
+        self.progressbar.configure(maximum=progress_maximum, value=0)
         self.progress_text_var.set("正在准备请求")
         self.metrics_var.set("已启动 0 · 已完成 0 · 失败 0" if config["transport_mode"] == TRANSPORT_CODEX_CLI else "已发送 0 · 已完成 0 · 失败 0")
         self.result_title_var.set("首个成功结果")
@@ -1352,13 +1380,26 @@ class BatchSenderApp:
         self.root.after(0, lambda: self.append_log(line))
 
     def apply_progress(self, event: ProgressEvent) -> None:
-        self.progressbar.configure(maximum=max(1, event.total_cap), value=event.completed_total)
+        unlimited = bool(self.last_run_config and int(self.last_run_config.get("retry_count", 0)) == 0)
+        if unlimited:
+            if event.round_size > 0:
+                self.progressbar.configure(maximum=event.round_size, value=event.completed_in_round)
+        else:
+            self.progressbar.configure(maximum=max(1, event.total_cap), value=event.completed_total)
         launched_label = "已启动" if self.last_run_config and self.last_run_config.get("transport_mode") == TRANSPORT_CODEX_CLI else "已发送"
-        self.metrics_var.set(
-            f"{launched_label} {event.launched_total}/{event.total_cap} · 已完成 {event.completed_total} · 失败 {event.failed_total}"
-        )
+        if unlimited:
+            self.metrics_var.set(
+                f"{launched_label} {event.launched_total} · 已完成 {event.completed_total} · 失败 {event.failed_total}"
+            )
+        else:
+            self.metrics_var.set(
+                f"{launched_label} {event.launched_total}/{event.total_cap} · 已完成 {event.completed_total} · 失败 {event.failed_total}"
+            )
         if event.kind == "round_start":
-            self.progress_text_var.set(f"第 {event.round_no}/{event.max_rounds} 批正在发送")
+            if unlimited:
+                self.progress_text_var.set(f"第 {event.round_no} 批正在发送（无限重试）")
+            else:
+                self.progress_text_var.set(f"第 {event.round_no}/{event.max_rounds} 批正在发送")
         elif event.kind == "first_success" and event.winner is not None:
             if self.last_run_config and self.last_run_config.get("transport_mode") == TRANSPORT_CODEX_CLI:
                 message = (
@@ -1379,7 +1420,7 @@ class BatchSenderApp:
             self.progress_text_var.set(event.message)
             self._set_status("warning")
         elif event.kind == "no_result":
-            self.progress_text_var.set("已达到重试上限，没有成功响应")
+            self.progress_text_var.set(event.message or "没有成功响应")
         elif event.kind == "done":
             self.progress_text_var.set("本次运行已完成")
 
@@ -1420,9 +1461,10 @@ class BatchSenderApp:
             self.progress_text_var.set("已停止")
             self._set_status("idle")
         else:
-            self.progress_text_var.set("没有成功响应，请查看运行日志")
+            message = self.progress_text_var.get().strip() or "没有成功响应，请查看运行日志"
+            self.progress_text_var.set(message)
             self.result_title_var.set("尚无成功结果")
-            self._set_readonly_text(self.result_text, "本次运行没有成功响应")
+            self._set_readonly_text(self.result_text, message)
             self._set_status("error")
         self._refresh_start_state()
 
@@ -1460,6 +1502,151 @@ class BatchSenderApp:
             self._show_notice("已恢复默认设置")
         except OSError as exc:
             self._show_notice(str(exc), error=True)
+
+    def open_settings(self) -> None:
+        if self.running or self.blocked_by_unfinished:
+            return
+        if self.settings_window is not None and self.settings_window.winfo_exists():
+            self.settings_window.lift()
+            self.settings_window.focus_force()
+            return
+
+        window = tk.Toplevel(self.root)
+        self.settings_window = window
+        window.title("应用设置")
+        window.transient(self.root)
+        window.resizable(False, False)
+        window.configure(bg=SURFACE)
+        window.grid_rowconfigure(0, weight=1)
+        window.grid_columnconfigure(0, weight=1)
+        icon_path = resource_path("assets/app.ico")
+        if icon_path.exists():
+            try:
+                window.iconbitmap(default=str(icon_path))
+            except tk.TclError:
+                pass
+
+        retry_var = tk.StringVar(value=self.retry_count_var.get())
+        interval_var = tk.StringVar(value=self.retry_interval_var.get())
+        max_wait_var = tk.StringVar(value=self.max_wait_var.get())
+        config_path = default_saved_config_path()
+        diagnostics_path = default_provider_diagnostics_path()
+        db_path = Path(str(self.base_config.get("db_path") or DEFAULT_DB_PATH))
+
+        content = ttk.Frame(window, style="Surface.TFrame", padding=(20, 18, 20, 18))
+        content.grid(row=0, column=0, sticky="nsew")
+        content.grid_columnconfigure(0, weight=1)
+        ttk.Label(content, text="应用设置", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            content,
+            text="0 表示持续重试，直到成功、手动停止或遇到不可重试错误。",
+            style="Meta.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 14))
+
+        retry_fields = ttk.Frame(content, style="Surface.TFrame")
+        retry_fields.grid(row=2, column=0, sticky="ew")
+        for column in range(3):
+            retry_fields.grid_columnconfigure(column, weight=1, uniform="settings")
+        for column, label, variable, maximum in (
+            (0, "重试（0=无限）", retry_var, MAX_FINITE_RETRY_COUNT),
+            (1, "重试间隔（秒）", interval_var, 86_400),
+            (2, "总等待（秒，0=无限）", max_wait_var, 31_536_000),
+        ):
+            holder = ttk.Frame(retry_fields, style="Surface.TFrame")
+            holder.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 8, 0))
+            holder.grid_columnconfigure(0, weight=1)
+            ttk.Label(holder, text=label, style="Field.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Spinbox(holder, textvariable=variable, from_=0, to=maximum, increment=1, width=10).grid(
+                row=1, column=0, sticky="ew", pady=(3, 0)
+            )
+
+        ttk.Separator(content, orient="horizontal").grid(row=3, column=0, sticky="ew", pady=16)
+        ttk.Label(content, text="配置位置", style="Section.TLabel").grid(row=4, column=0, sticky="w")
+
+        paths = ttk.Frame(content, style="Surface.TFrame")
+        paths.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        paths.grid_columnconfigure(1, weight=1)
+        for row, (label, value) in enumerate(
+            (
+                ("配置文件", config_path),
+                ("诊断日志", diagnostics_path),
+                ("CC Switch 数据库", db_path),
+            )
+        ):
+            ttk.Label(paths, text=label, style="Field.TLabel").grid(row=row, column=0, sticky="w", padx=(0, 10), pady=4)
+            entry = ttk.Entry(paths, width=52)
+            entry.insert(0, str(value))
+            entry.configure(state="readonly")
+            entry.grid(row=row, column=1, sticky="ew", pady=4)
+
+        actions = ttk.Frame(content, style="Surface.TFrame")
+        actions.grid(row=6, column=0, sticky="ew", pady=(18, 0))
+        actions.grid_columnconfigure(2, weight=1)
+        dialog_notice_var = tk.StringVar(value="")
+        ttk.Label(actions, textvariable=dialog_notice_var, style="Meta.TLabel").grid(
+            row=0, column=2, sticky="e", padx=12
+        )
+
+        def close() -> None:
+            if self.settings_window is not None:
+                self.settings_window.destroy()
+                self.settings_window = None
+
+        def save() -> None:
+            try:
+                config = self.collect_config(
+                    {
+                        "retry_count": retry_var.get(),
+                        "retry_interval_seconds": interval_var.get(),
+                        "max_wait_seconds": max_wait_var.get(),
+                    }
+                )
+                config["provider_id"] = "current"
+                save_saved_config(config)
+                self.base_config.update(config)
+                self.retry_count_var.set(str(config["retry_count"]))
+                self.retry_interval_var.set(self._number_text(config["retry_interval_seconds"]))
+                self.max_wait_var.set(self._number_text(config["max_wait_seconds"]))
+                self.schedule_preview()
+                self._show_notice("应用设置已保存")
+                close()
+            except (SenderError, OSError) as exc:
+                messagebox.showerror("保存失败", str(exc), parent=window)
+
+        def copy_config_path() -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(str(config_path))
+            self.root.update_idletasks()
+            dialog_notice_var.set("配置路径已复制")
+
+        open_button = self._tool_button(actions, "folder", self.open_config_directory, "打开配置目录")
+        open_button.grid(row=0, column=0, sticky="w")
+        copy_button = self._tool_button(actions, "copy", copy_config_path, "复制配置路径")
+        copy_button.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self._button(actions, "保存", "save", save, "Primary.TButton").grid(row=0, column=3, sticky="e")
+
+        window.protocol("WM_DELETE_WINDOW", close)
+        window.bind("<Escape>", lambda _event: close())
+        window.update_idletasks()
+        width, height = 700, 500
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - width) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - height) // 2)
+        window.geometry(f"{width}x{height}+{x}+{y}")
+        window.grab_set()
+        window.focus_force()
+
+    def open_config_directory(self) -> None:
+        directory = default_app_data_dir()
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            if os.name == "nt":
+                os.startfile(str(directory))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(directory)])
+            else:
+                subprocess.Popen(["xdg-open", str(directory)])
+        except OSError as exc:
+            messagebox.showerror("无法打开配置目录", str(exc), parent=self.settings_window or self.root)
 
     def copy_request_body(self) -> None:
         self._copy_to_clipboard(self.body_text.get("1.0", "end-1c"), "请求体已复制")
@@ -1572,6 +1759,7 @@ class BatchSenderApp:
             self.body_text.configure(state="disabled")
         self.refresh_button.state(["!disabled"] if enabled else ["disabled"])
         self.save_settings_button.state(["!disabled"] if enabled else ["disabled"])
+        self.settings_button.state(["!disabled"] if enabled and not self.blocked_by_unfinished else ["disabled"])
         self.reset_button.state(["!disabled"] if enabled else ["disabled"])
         self._apply_transport_state()
         self._refresh_start_state()

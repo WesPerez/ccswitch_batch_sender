@@ -5,8 +5,10 @@ import copy
 import ctypes
 import datetime as dt
 import functools
+import itertools
 import json
 import os
+import platform
 import queue
 import random
 import re
@@ -37,10 +39,13 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".cc-switch" / "cc-switch.db"
 DIAGNOSTIC_LOG_MAX_BYTES = 512 * 1024
 DIAGNOSTIC_LOG_BACKUP_COUNT = 2
-REGISTRY_PATH = r"Software\CCSwitchBatchSender"
-REGISTRY_VALUE = "SettingsJson"
-REGISTRY_SCHEMA_VALUE = "SchemaVersion"
-REGISTRY_SCHEMA_VERSION = 7
+CONFIG_SCHEMA_VERSION = 8
+CONFIG_SCHEMA_KEY = "schema_version"
+CONFIG_SETTINGS_KEY = "settings"
+MAX_FINITE_RETRY_COUNT = 2_147_483_647
+LEGACY_REGISTRY_PATH = r"Software\CCSwitchBatchSender"
+LEGACY_REGISTRY_VALUE = "SettingsJson"
+LEGACY_REGISTRY_SCHEMA_VALUE = "SchemaVersion"
 MUTEX_NAME = r"Local\CCSwitchBatchSender.App"
 PROMPT_CACHE_KEY_PLACEHOLDER = "<每个请求唯一>"
 RANDOM_TASK_PLACEHOLDER = "<每个请求随机任务>"
@@ -48,7 +53,7 @@ LEGACY_RANDOM_PROBE_PLACEHOLDER = "<每个请求随机探针>"
 RANDOM_PROBE_PLACEHOLDER = RANDOM_TASK_PLACEHOLDER
 RANDOM_TASK_PLACEHOLDERS = (RANDOM_TASK_PLACEHOLDER, LEGACY_RANDOM_PROBE_PLACEHOLDER)
 DEFAULT_FIXED_MESSAGE = "请说明批量请求为什么需要超时。"
-CODEX_VERSION_HEADER = "X-CCSwitch-Local-Codex-CLI-Version"
+CODEX_COMPATIBILITY_ORIGINATOR = "codex_exec"
 TRANSPORT_CODEX_CLI = "codex_cli"
 TRANSPORT_DIRECT = "direct"
 PROXY_MANAGED_TOKEN = "PROXY_MANAGED"
@@ -66,18 +71,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "message": DEFAULT_FIXED_MESSAGE,
     "random_probe_enabled": True,
     "request_count": 15,
-    "retry_count": 10,
+    "retry_count": 0,
     "max_output_tokens": 64,
     "request_timeout_seconds": 10,
-    "max_wait_seconds": 7200,
+    "max_wait_seconds": 0,
     "retry_interval_seconds": 3,
     "poll_interval_seconds": 2,
-    "user_agent": f"{APP_NAME}/{APP_VERSION} (non-codex)",
-    "originator": APP_NAME,
     "db_path": "",
     "endpoint_style": "auto",
     "unique_prompt_cache_key": True,
-    "send_codex_version_header": True,
     "save_full_response": False,
     "custom_body_enabled": False,
     "custom_body": None,
@@ -99,7 +101,6 @@ PERSISTED_KEYS = (
     "poll_interval_seconds",
     "endpoint_style",
     "unique_prompt_cache_key",
-    "send_codex_version_header",
     "save_full_response",
     "custom_body_enabled",
     "custom_body",
@@ -228,13 +229,19 @@ class RunLogger:
             _console_print(line)
 
 
-def default_provider_diagnostics_path() -> Path:
+def default_app_data_dir() -> Path:
     local_app_data = str(os.environ.get("LOCALAPPDATA") or "").strip()
     if local_app_data:
-        root = Path(local_app_data) / "CCSwitchBatchSender"
-    else:
-        root = Path.home() / ".ccswitch-batch-sender"
-    return root / "logs" / "provider-diagnostics.jsonl"
+        return Path(local_app_data) / "CCSwitchBatchSender"
+    return Path.home() / ".ccswitch-batch-sender"
+
+
+def default_saved_config_path() -> Path:
+    return default_app_data_dir() / "settings.json"
+
+
+def default_provider_diagnostics_path() -> Path:
+    return default_app_data_dir() / "logs" / "provider-diagnostics.jsonl"
 
 
 class ProviderDiagnostics:
@@ -478,12 +485,9 @@ def normalize_config(values: dict[str, Any] | None = None) -> dict[str, Any]:
         "max_wait_seconds": _coerce_float(raw.get("max_wait_seconds"), "总等待时间"),
         "retry_interval_seconds": _coerce_float(raw.get("retry_interval_seconds"), "重试间隔"),
         "poll_interval_seconds": _coerce_float(raw.get("poll_interval_seconds"), "轮询间隔"),
-        "user_agent": str(raw.get("user_agent", DEFAULT_CONFIG["user_agent"])).strip(),
-        "originator": str(raw.get("originator", DEFAULT_CONFIG["originator"])).strip(),
         "db_path": str(raw.get("db_path", "")).strip(),
         "endpoint_style": str(raw.get("endpoint_style", "auto")).strip().lower(),
         "unique_prompt_cache_key": bool(raw.get("unique_prompt_cache_key", True)),
-        "send_codex_version_header": bool(raw.get("send_codex_version_header", True)),
         "save_full_response": bool(raw.get("save_full_response", False)),
         "custom_body_enabled": bool(raw.get("custom_body_enabled", False)),
         "custom_body": copy.deepcopy(raw.get("custom_body")),
@@ -495,8 +499,10 @@ def normalize_config(values: dict[str, Any] | None = None) -> dict[str, Any]:
         raise SenderError("请求来源只能是官方 Codex CLI 或直接 API。")
     if not 1 <= config["cli_concurrency"] <= 10:
         raise SenderError("CLI 并发数必须在 1 到 10 之间。")
-    if not 0 <= config["retry_count"] <= 10:
-        raise SenderError("重试次数必须在 0 到 10 之间。")
+    if config["retry_count"] < 0:
+        raise SenderError("重试次数不能小于 0；0 表示无限重试。")
+    if config["retry_count"] > MAX_FINITE_RETRY_COUNT:
+        raise SenderError(f"有限重试次数不能超过 {MAX_FINITE_RETRY_COUNT}；0 表示无限重试。")
     if not 1 <= config["max_output_tokens"] <= 4096:
         raise SenderError("最大输出 token 必须在 1 到 4096 之间。")
     if config["request_timeout_seconds"] <= 0:
@@ -536,6 +542,15 @@ def load_json_config(path: Path) -> dict[str, Any]:
         raise SenderError(f"配置文件不是有效 JSON：{path}: {exc}") from exc
     if not isinstance(loaded, dict):
         raise SenderError(f"配置文件必须是 JSON 对象：{path}")
+    if CONFIG_SCHEMA_KEY in loaded and CONFIG_SETTINGS_KEY in loaded:
+        values = loaded.get(CONFIG_SETTINGS_KEY)
+        if not isinstance(values, dict):
+            raise SenderError(f"配置文件 settings 必须是 JSON 对象：{path}")
+        try:
+            schema_version = int(loaded.get(CONFIG_SCHEMA_KEY, 0))
+        except (TypeError, ValueError):
+            schema_version = 0
+        return normalize_config(migrate_saved_config(values, schema_version))
     return normalize_config(loaded)
 
 
@@ -569,34 +584,55 @@ def migrate_saved_config(values: dict[str, Any], schema_version: int) -> dict[st
             migrated["request_count"] = DEFAULT_CONFIG["request_count"]
             migrated["retry_count"] = DEFAULT_CONFIG["retry_count"]
         migrated.setdefault("transport_mode", DEFAULT_CONFIG["transport_mode"])
-    if schema_version < 7 and migrated.get("request_timeout_seconds") in {
-        None,
-        7200,
-        "7200",
-        "7200.0",
-    }:
-        migrated["request_timeout_seconds"] = DEFAULT_CONFIG["request_timeout_seconds"]
+    if schema_version < 7:
+        migrated.pop("send_codex_version_header", None)
+        migrated.pop("user_agent", None)
+        migrated.pop("originator", None)
+        if migrated.get("request_timeout_seconds") in {
+            None,
+            7200,
+            "7200",
+            "7200.0",
+        }:
+            migrated["request_timeout_seconds"] = DEFAULT_CONFIG["request_timeout_seconds"]
+    if schema_version < 8:
+        if migrated.get("retry_count") in {None, 10, "10"}:
+            migrated["retry_count"] = DEFAULT_CONFIG["retry_count"]
+        if migrated.get("max_wait_seconds") in {None, 7200, 7200.0, "7200"}:
+            migrated["max_wait_seconds"] = DEFAULT_CONFIG["max_wait_seconds"]
     return migrated
 
 
-def load_saved_config() -> dict[str, Any]:
+def _load_legacy_registry_config() -> dict[str, Any] | None:
     if os.name != "nt":
-        return normalize_config()
+        return None
     try:
         import winreg
 
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REGISTRY_PATH) as key:
-            raw, _ = winreg.QueryValueEx(key, REGISTRY_VALUE)
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, LEGACY_REGISTRY_PATH) as key:
+            raw, _ = winreg.QueryValueEx(key, LEGACY_REGISTRY_VALUE)
             try:
-                schema_version, _ = winreg.QueryValueEx(key, REGISTRY_SCHEMA_VALUE)
+                schema_version, _ = winreg.QueryValueEx(key, LEGACY_REGISTRY_SCHEMA_VALUE)
             except FileNotFoundError:
                 schema_version = 0
         loaded = json.loads(str(raw))
         if not isinstance(loaded, dict):
-            return normalize_config()
+            return None
         return normalize_config(migrate_saved_config(loaded, int(schema_version)))
     except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError, SenderError):
-        return normalize_config()
+        return None
+
+
+def _delete_legacy_registry_config() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, LEGACY_REGISTRY_PATH)
+        return True
+    except (FileNotFoundError, OSError):
+        return False
 
 
 def persistent_config_payload(config: dict[str, Any]) -> dict[str, Any]:
@@ -604,21 +640,76 @@ def persistent_config_payload(config: dict[str, Any]) -> dict[str, Any]:
     return {key: copy.deepcopy(normalized[key]) for key in PERSISTED_KEYS}
 
 
-def save_saved_config(config: dict[str, Any]) -> None:
-    if os.name != "nt":
-        return
-    import winreg
+def persistent_config_document(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        CONFIG_SCHEMA_KEY: CONFIG_SCHEMA_VERSION,
+        CONFIG_SETTINGS_KEY: persistent_config_payload(config),
+    }
 
-    payload = persistent_config_payload(config)
-    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, REGISTRY_PATH, 0, winreg.KEY_WRITE) as key:
-        winreg.SetValueEx(key, REGISTRY_SCHEMA_VALUE, 0, winreg.REG_DWORD, REGISTRY_SCHEMA_VERSION)
-        winreg.SetValueEx(
-            key,
-            REGISTRY_VALUE,
-            0,
-            winreg.REG_SZ,
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+
+def _load_saved_config_file(path: Path) -> dict[str, Any]:
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise SenderError(f"配置文件必须是 JSON 对象：{path}")
+    if CONFIG_SETTINGS_KEY in loaded:
+        values = loaded.get(CONFIG_SETTINGS_KEY)
+        schema_version = loaded.get(CONFIG_SCHEMA_KEY, 0)
+    else:
+        values = {key: value for key, value in loaded.items() if key != CONFIG_SCHEMA_KEY}
+        schema_version = loaded.get(CONFIG_SCHEMA_KEY, 0)
+    if not isinstance(values, dict):
+        raise SenderError(f"配置文件 settings 必须是 JSON 对象：{path}")
+    try:
+        version = int(schema_version)
+    except (TypeError, ValueError):
+        version = 0
+    return normalize_config(migrate_saved_config(values, version))
+
+
+def load_saved_config(path: Path | None = None) -> dict[str, Any]:
+    target = path or default_saved_config_path()
+    try:
+        config = _load_saved_config_file(target)
+    except FileNotFoundError:
+        config = None
+    except (OSError, ValueError, json.JSONDecodeError, SenderError):
+        legacy_config = _load_legacy_registry_config() if path is None else None
+        return legacy_config or normalize_config()
+
+    if config is not None:
+        if path is None:
+            _delete_legacy_registry_config()
+        return config
+
+    legacy_config = _load_legacy_registry_config() if path is None else None
+    config = legacy_config or normalize_config()
+    try:
+        save_saved_config(config, path=target)
+    except OSError:
+        return config
+    if legacy_config is not None:
+        _delete_legacy_registry_config()
+    return config
+
+
+def save_saved_config(config: dict[str, Any], *, path: Path | None = None) -> None:
+    target = path or default_saved_config_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    document = persistent_config_document(config)
+
+    try:
+        temporary.write_text(
+            json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
         )
+        temporary.replace(target)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _config_value(config_obj: Any, key: str) -> str:
@@ -1454,6 +1545,35 @@ def send_one_codex_cli(
     )
 
 
+def _codex_compatibility_architecture(machine: str) -> str:
+    normalized = machine.strip().lower()
+    return {
+        "amd64": "x86_64",
+        "x86_64": "x86_64",
+        "arm64": "aarch64",
+        "aarch64": "aarch64",
+    }.get(normalized, normalized or "unknown")
+
+
+def build_codex_compatibility_user_agent(
+    codex_version: CodexCliVersion | None = None,
+    *,
+    windows_version: str | None = None,
+    machine: str | None = None,
+) -> str:
+    detected = codex_version if codex_version is not None else detect_codex_cli_version()
+    version = detected.version or "unknown"
+    os_version = (windows_version if windows_version is not None else platform.version()).strip() or "unknown"
+    architecture = _codex_compatibility_architecture(
+        machine if machine is not None else platform.machine()
+    )
+    return (
+        f"{CODEX_COMPATIBILITY_ORIGINATOR}/{version} "
+        f"(Windows {os_version}; {architecture}) unknown "
+        f"({CODEX_COMPATIBILITY_ORIGINATOR}; {version})"
+    )
+
+
 def build_request_headers(
     provider: Provider,
     config: dict[str, Any],
@@ -1465,12 +1585,9 @@ def build_request_headers(
         "Accept": "application/json",
         "Content-Type": "application/json",
         "Authorization": "Bearer " + provider.api_key,
-        "User-Agent": str(config["user_agent"]),
+        "User-Agent": build_codex_compatibility_user_agent(version),
+        "Originator": CODEX_COMPATIBILITY_ORIGINATOR,
     }
-    if provider.api_format == "openai_responses":
-        headers["Originator"] = str(config["originator"])
-    if bool(config.get("send_codex_version_header", True)) and version.version:
-        headers[CODEX_VERSION_HEADER] = version.version
     return headers
 
 
@@ -2081,8 +2198,13 @@ def run_batch(
     stop_event = stop_event or threading.Event()
     started = time.monotonic()
     request_count = int(config["request_count"])
-    max_rounds = 1 + int(config["retry_count"])
-    total_cap = request_count * max_rounds
+    retry_count = int(config["retry_count"])
+    unlimited_retries = retry_count == 0
+    max_rounds = 0 if unlimited_retries else 1 + retry_count
+    total_cap = 0 if unlimited_retries else request_count * max_rounds
+    retry_label = "unlimited" if unlimited_retries else str(retry_count)
+    cap_label = "unlimited" if unlimited_retries else str(total_cap)
+    round_limit_label = "unlimited" if unlimited_retries else str(max_rounds)
     max_wait = float(config["max_wait_seconds"])
     run_deadline = started + max_wait if max_wait > 0 else None
     launched_total = 0
@@ -2104,8 +2226,8 @@ def run_batch(
             "codex_cli=%s cli_concurrency=%s"
             % (
                 request_count,
-                config["retry_count"],
-                total_cap,
+                retry_label,
+                cap_label,
                 task_mode,
                 codex_version.version or "unavailable",
                 config["cli_concurrency"],
@@ -2114,18 +2236,21 @@ def run_batch(
     else:
         logger.log(
             "RUN_START count=%s retries=%s post_cap=%s task_mode=%s transport=direct-api "
-            "codex_cli=%s codex_header=%s client=ccswitch-batch-sender"
+            "codex_cli=%s client=codex-compatibility-simulation originator=codex_exec"
             % (
                 request_count,
-                config["retry_count"],
-                total_cap,
+                retry_label,
+                cap_label,
                 task_mode,
                 codex_version.version or "unavailable",
-                "on" if bool(config.get("send_codex_version_header", True)) else "off",
             )
         )
 
-    for round_no in range(1, max_rounds + 1):
+    round_numbers: Iterable[int] = itertools.count(1) if unlimited_retries else range(1, max_rounds + 1)
+    last_round_no = 0
+    no_result_message = "没有成功响应。"
+    for round_no in round_numbers:
+        last_round_no = round_no
         if stop_event.is_set():
             _emit_progress(
                 on_progress,
@@ -2141,7 +2266,8 @@ def run_batch(
             return RunOutcome(130, winner, launched_total, completed_total, failed_total)
         if run_deadline is not None and time.monotonic() >= run_deadline:
             logger.log("TIMEOUT reached before starting the next batch")
-            return RunOutcome(1, winner, launched_total, completed_total, failed_total)
+            no_result_message = "已达到总等待时间，没有成功响应。"
+            break
 
         if dry_run:
             if transport_mode == TRANSPORT_CODEX_CLI:
@@ -2153,7 +2279,7 @@ def run_batch(
                         provider.model,
                         provider.api_format,
                         request_count,
-                        config["retry_count"],
+                        retry_label,
                         config["cli_concurrency"],
                         [_redact_url(item) for item in endpoints],
                     )
@@ -2166,7 +2292,7 @@ def run_batch(
                         provider.model,
                         provider.api_format,
                         request_count,
-                        config["retry_count"],
+                        retry_label,
                         [_redact_url(item) for item in endpoints],
                     )
                 )
@@ -2189,7 +2315,7 @@ def run_batch(
             "BATCH_START batch=%s/%s sending=%s transport=%s provider=%s model=%s api_format=%s"
             % (
                 round_no,
-                max_rounds,
+                round_limit_label,
                 request_count,
                 "official-codex-cli" if transport_mode == TRANSPORT_CODEX_CLI else "direct-api",
                 provider.name,
@@ -2387,14 +2513,17 @@ def run_batch(
             return RunOutcome(130, None, launched_total, completed_total, failed_total)
         if _all_failures_are_non_retryable(round_results):
             logger.log("HARD_FAIL all responses indicate a non-retryable request/configuration error")
+            no_result_message = "请求或配置错误不可重试。"
             break
-        if round_no >= max_rounds:
+        if not unlimited_retries and round_no >= max_rounds:
+            no_result_message = "已达到重试上限，没有成功响应。"
             break
         if run_deadline is not None and time.monotonic() >= run_deadline:
             logger.log("TIMEOUT no successful response within the configured total wait")
+            no_result_message = "已达到总等待时间，没有成功响应。"
             break
         interval = float(config["retry_interval_seconds"])
-        logger.log(f"RETRY_WAIT seconds={interval:.1f} next_batch={round_no + 1}/{max_rounds}")
+        logger.log(f"RETRY_WAIT seconds={interval:.1f} next_batch={round_no + 1}/{round_limit_label}")
         _emit_progress(
             on_progress,
             kind="retry_wait",
@@ -2414,18 +2543,18 @@ def run_batch(
 
     logger.log(
         "NO_RESULT launched=%s completed=%s failed=%s batches=%s"
-        % (launched_total, completed_total, failed_total, max_rounds)
+        % (launched_total, completed_total, failed_total, last_round_no)
     )
     _emit_progress(
         on_progress,
         kind="no_result",
-        round_no=max_rounds,
+        round_no=last_round_no,
         max_rounds=max_rounds,
         launched_total=launched_total,
         completed_total=completed_total,
         failed_total=failed_total,
         total_cap=total_cap,
-        message="没有成功响应。",
+        message=no_result_message,
     )
     return RunOutcome(1, None, launched_total, completed_total, failed_total)
 
@@ -2480,7 +2609,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     parser.add_argument("--cli-concurrency", type=int, help="官方 Codex CLI 模式的最大并发任务数")
     parser.add_argument("--count", type=int, help="覆盖每批请求次数")
-    parser.add_argument("--retry-count", type=int, help="覆盖额外批次重试次数")
+    parser.add_argument("--retry-count", type=int, help="覆盖额外批次重试次数；0 表示无限重试")
     parser.add_argument("--message", help="覆盖提示词")
     prompt_mode = parser.add_mutually_exclusive_group()
     prompt_mode.add_argument(
@@ -2501,16 +2630,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--ui-smoke", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    config = load_json_config(args.config) if args.config else load_saved_config()
-    config = _apply_cli_overrides(config, args)
     gui_mode = args.gui or (not args.headless and not args.dry_run)
-    diagnostics = None if args.no_provider_diagnostics else ProviderDiagnostics()
-    if diagnostics is not None:
-        diagnostics.record(
-            "APP_START",
-            mode="gui" if gui_mode else "headless",
-            frozen=bool(getattr(sys, "frozen", False)),
-        )
     mutex = SingleInstanceMutex()
     if not mutex.acquire():
         if gui_mode:
@@ -2519,6 +2639,19 @@ def main(argv: Iterable[str] | None = None) -> int:
             _console_print("应用已经在运行。", error=True)
         return 0
     try:
+        if args.config:
+            config = load_json_config(args.config)
+            load_saved_config()
+        else:
+            config = load_saved_config()
+        config = _apply_cli_overrides(config, args)
+        diagnostics = None if args.no_provider_diagnostics else ProviderDiagnostics()
+        if diagnostics is not None:
+            diagnostics.record(
+                "APP_START",
+                mode="gui" if gui_mode else "headless",
+                frozen=bool(getattr(sys, "frozen", False)),
+            )
         if gui_mode:
             enable_dpi_awareness()
             return launch_gui(config, smoke_ui=args.ui_smoke, diagnostics=diagnostics)
