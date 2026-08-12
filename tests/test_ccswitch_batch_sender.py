@@ -257,6 +257,10 @@ class ConfigTests(unittest.TestCase):
         migrated = sender.migrate_saved_config({"request_timeout_seconds": 300}, 6)
         self.assertEqual(migrated["request_timeout_seconds"], 300)
 
+    def test_current_saved_request_timeout_is_preserved(self) -> None:
+        migrated = sender.migrate_saved_config({"request_timeout_seconds": 7200}, 8)
+        self.assertEqual(migrated["request_timeout_seconds"], 7200)
+
     def test_cli_concurrency_accepts_ten_and_rejects_more(self) -> None:
         self.assertEqual(sender.normalize_config({"cli_concurrency": 10})["cli_concurrency"], 10)
         with self.assertRaises(sender.SenderError):
@@ -292,8 +296,21 @@ class ConfigTests(unittest.TestCase):
             document = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(document["schema_version"], sender.CONFIG_SCHEMA_VERSION)
             self.assertEqual(document["settings"]["retry_count"], 25)
+            self.assertEqual(document["settings"]["request_timeout_seconds"], 10)
             self.assertEqual(sender.load_saved_config(path=path)["retry_interval_seconds"], 7)
             self.assertEqual(sender.load_json_config(path)["retry_count"], 25)
+
+    def test_saved_config_round_trips_request_timeout(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ccswitch-config-test-") as temp:
+            path = Path(temp) / "settings.json"
+            sender.save_saved_config(
+                sender.normalize_config({"request_timeout_seconds": 37}),
+                path=path,
+            )
+
+            loaded = sender.load_saved_config(path=path)
+
+            self.assertEqual(loaded["request_timeout_seconds"], 37)
 
     def test_legacy_registry_config_is_saved_before_cleanup(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ccswitch-config-migration-") as temp:
@@ -1214,6 +1231,225 @@ class RunnerTests(unittest.TestCase):
 
         self.assertEqual(outcome.code, 1)
         self.assertEqual(provider_loads, ["load"])
+
+    def test_request_timeout_does_not_terminate_the_batch(self) -> None:
+        calls: list[tuple[int, int]] = []
+        lock = threading.Lock()
+
+        def fake_sender(index, provider, config, deadline, logger, abort_polling, *, round_no=1):
+            with lock:
+                calls.append((round_no, index))
+            time.sleep(0.06)
+            return sender.AttemptResult(
+                index=index,
+                round_no=round_no,
+                ok=False,
+                status=502,
+                error="bad gateway",
+            )
+
+        outcome = sender.run_batch(
+            sender.normalize_config(
+                {
+                    "request_count": 2,
+                    "retry_count": 1,
+                    "request_timeout_seconds": 0.02,
+                    "max_wait_seconds": 0,
+                    "retry_interval_seconds": 0,
+                }
+            ),
+            sender.RunLogger(callback=lambda _line: None),
+            provider_loader=lambda _config: self.provider,
+            sender=fake_sender,
+        )
+
+        self.assertEqual(outcome.code, 1)
+        self.assertEqual(outcome.launched, 4)
+        self.assertEqual(outcome.completed, 4)
+        self.assertEqual(outcome.unfinished, 0)
+        self.assertEqual(sorted(calls), [(1, 1), (1, 2), (2, 1), (2, 2)])
+
+    def test_each_request_deadline_uses_request_timeout_not_total_wait(self) -> None:
+        remaining_deadlines: list[float] = []
+
+        def fake_sender(index, provider, config, deadline, logger, abort_polling, *, round_no=1):
+            remaining_deadlines.append(deadline - time.monotonic())
+            return sender.AttemptResult(
+                index=index,
+                round_no=round_no,
+                ok=False,
+                status=502,
+                error="bad gateway",
+            )
+
+        outcome = sender.run_batch(
+            sender.normalize_config(
+                {
+                    "request_count": 1,
+                    "retry_count": 1,
+                    "request_timeout_seconds": 0.2,
+                    "max_wait_seconds": 1,
+                    "retry_interval_seconds": 0,
+                }
+            ),
+            sender.RunLogger(callback=lambda _line: None),
+            provider_loader=lambda _config: self.provider,
+            sender=fake_sender,
+        )
+
+        self.assertEqual(outcome.code, 1)
+        self.assertEqual(len(remaining_deadlines), 2)
+        self.assertTrue(all(0 <= remaining <= 0.3 for remaining in remaining_deadlines))
+
+    def test_sender_ignoring_deadline_cannot_block_run_forever(self) -> None:
+        release_sender = threading.Event()
+        sender_finished = threading.Event()
+        progress: list[sender.ProgressEvent] = []
+
+        def fake_sender(index, provider, config, deadline, logger, abort_polling, *, round_no=1):
+            release_sender.wait()
+            sender_finished.set()
+            return sender.AttemptResult(
+                index=index,
+                round_no=round_no,
+                ok=False,
+                status=502,
+                error="bad gateway",
+            )
+
+        started = time.monotonic()
+        try:
+            with mock.patch.object(sender, "REQUEST_COMPLETION_GRACE_SECONDS", 0.02):
+                outcome = sender.run_batch(
+                    sender.normalize_config(
+                        {
+                            "request_count": 1,
+                            "retry_count": 1,
+                            "request_timeout_seconds": 0.02,
+                            "max_wait_seconds": 0,
+                            "retry_interval_seconds": 0,
+                        }
+                    ),
+                    sender.RunLogger(callback=lambda _line: None),
+                    on_progress=progress.append,
+                    provider_loader=lambda _config: self.provider,
+                    sender=fake_sender,
+                )
+        finally:
+            release_sender.set()
+
+        self.assertTrue(sender_finished.wait(0.5))
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(outcome.code, 1)
+        self.assertEqual(outcome.launched, 2)
+        self.assertEqual(outcome.completed, 2)
+        self.assertEqual(outcome.failed, 2)
+        self.assertEqual(outcome.unfinished, 1)
+        self.assertFalse(any(event.kind == "timeout" for event in progress))
+        request_timeouts = [
+            event for event in progress if event.kind == "request_complete" and "单请求超时" in event.message
+        ]
+        blocked_requests = [
+            event for event in progress if event.kind == "request_complete" and "发送槽位" in event.message
+        ]
+        self.assertEqual(len(request_timeouts), 1)
+        self.assertEqual(len(blocked_requests), 1)
+
+    def test_stop_does_not_wait_for_a_stuck_sender_deadline(self) -> None:
+        release_sender = threading.Event()
+        sender_started = threading.Event()
+        stop_event = threading.Event()
+        outcome_holder: list[sender.RunOutcome] = []
+
+        def fake_sender(index, provider, config, deadline, logger, abort_polling, *, round_no=1):
+            sender_started.set()
+            release_sender.wait()
+            return sender.AttemptResult(index=index, round_no=round_no, ok=False, error="stuck")
+
+        def run() -> None:
+            outcome_holder.append(
+                sender.run_batch(
+                    sender.normalize_config(
+                        {
+                            "request_count": 1,
+                            "retry_count": 1,
+                            "request_timeout_seconds": 60,
+                            "max_wait_seconds": 0,
+                            "retry_interval_seconds": 0,
+                        }
+                    ),
+                    sender.RunLogger(callback=lambda _line: None),
+                    stop_event=stop_event,
+                    provider_loader=lambda _config: self.provider,
+                    sender=fake_sender,
+                )
+            )
+
+        runner = threading.Thread(target=run, daemon=True)
+        try:
+            with mock.patch.object(sender, "REQUEST_COMPLETION_GRACE_SECONDS", 0.02):
+                runner.start()
+                self.assertTrue(sender_started.wait(0.5))
+                stopped_at = time.monotonic()
+                stop_event.set()
+                runner.join(0.5)
+        finally:
+            release_sender.set()
+            runner.join(0.5)
+
+        self.assertFalse(runner.is_alive())
+        self.assertLess(time.monotonic() - stopped_at, 0.5)
+        self.assertEqual(len(outcome_holder), 1)
+        self.assertEqual(outcome_holder[0].code, 130)
+        self.assertEqual(outcome_holder[0].unfinished, 1)
+
+    def test_unlimited_run_waits_for_stuck_sender_until_stopped(self) -> None:
+        release_sender = threading.Event()
+        sender_started = threading.Event()
+        stop_event = threading.Event()
+        outcome_holder: list[sender.RunOutcome] = []
+
+        def fake_sender(index, provider, config, deadline, logger, abort_polling, *, round_no=1):
+            sender_started.set()
+            release_sender.wait()
+            return sender.AttemptResult(index=index, round_no=round_no, ok=False, error="stuck")
+
+        def run() -> None:
+            outcome_holder.append(
+                sender.run_batch(
+                    sender.normalize_config(
+                        {
+                            "request_count": 1,
+                            "retry_count": 0,
+                            "request_timeout_seconds": 0.02,
+                            "max_wait_seconds": 0,
+                            "retry_interval_seconds": 0,
+                        }
+                    ),
+                    sender.RunLogger(callback=lambda _line: None),
+                    stop_event=stop_event,
+                    provider_loader=lambda _config: self.provider,
+                    sender=fake_sender,
+                )
+            )
+
+        runner = threading.Thread(target=run, daemon=True)
+        try:
+            with mock.patch.object(sender, "REQUEST_COMPLETION_GRACE_SECONDS", 0.02):
+                runner.start()
+                self.assertTrue(sender_started.wait(0.5))
+                time.sleep(0.1)
+                self.assertTrue(runner.is_alive())
+                stop_event.set()
+                runner.join(0.5)
+        finally:
+            release_sender.set()
+            runner.join(0.5)
+
+        self.assertFalse(runner.is_alive())
+        self.assertEqual(len(outcome_holder), 1)
+        self.assertEqual(outcome_holder[0].code, 130)
+        self.assertEqual(outcome_holder[0].unfinished, 1)
 
     def test_zero_retries_runs_until_success(self) -> None:
         calls: list[int] = []

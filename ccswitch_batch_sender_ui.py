@@ -697,7 +697,7 @@ class BatchSenderApp:
         self.request_timeout_spin = self._spin_field(
             timing,
             1,
-            "单次超时",
+            "单请求超时",
             self.request_timeout_var,
             1,
             86400,
@@ -1528,6 +1528,7 @@ class BatchSenderApp:
 
         retry_var = tk.StringVar(value=self.retry_count_var.get())
         interval_var = tk.StringVar(value=self.retry_interval_var.get())
+        request_timeout_var = tk.StringVar(value=self.request_timeout_var.get())
         max_wait_var = tk.StringVar(value=self.max_wait_var.get())
         config_path = default_saved_config_path()
         diagnostics_path = default_provider_diagnostics_path()
@@ -1545,18 +1546,26 @@ class BatchSenderApp:
 
         retry_fields = ttk.Frame(content, style="Surface.TFrame")
         retry_fields.grid(row=2, column=0, sticky="ew")
-        for column in range(3):
+        for column in range(4):
             retry_fields.grid_columnconfigure(column, weight=1, uniform="settings")
-        for column, label, variable, maximum in (
-            (0, "重试（0=无限）", retry_var, MAX_FINITE_RETRY_COUNT),
-            (1, "重试间隔（秒）", interval_var, 86_400),
-            (2, "总等待（秒，0=无限）", max_wait_var, 31_536_000),
+        for column, label, variable, minimum, maximum in (
+            (0, "重试（0=无限）", retry_var, 0, MAX_FINITE_RETRY_COUNT),
+            (1, "重试间隔（秒）", interval_var, 0, 86_400),
+            (2, "单请求超时（秒）", request_timeout_var, 1, 86_400),
+            (3, "总等待（秒，0=无限）", max_wait_var, 0, 31_536_000),
         ):
             holder = ttk.Frame(retry_fields, style="Surface.TFrame")
             holder.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 8, 0))
             holder.grid_columnconfigure(0, weight=1)
             ttk.Label(holder, text=label, style="Field.TLabel").grid(row=0, column=0, sticky="w")
-            ttk.Spinbox(holder, textvariable=variable, from_=0, to=maximum, increment=1, width=10).grid(
+            ttk.Spinbox(
+                holder,
+                textvariable=variable,
+                from_=minimum,
+                to=maximum,
+                increment=1,
+                width=8,
+            ).grid(
                 row=1, column=0, sticky="ew", pady=(3, 0)
             )
 
@@ -1598,6 +1607,7 @@ class BatchSenderApp:
                     {
                         "retry_count": retry_var.get(),
                         "retry_interval_seconds": interval_var.get(),
+                        "request_timeout_seconds": request_timeout_var.get(),
                         "max_wait_seconds": max_wait_var.get(),
                     }
                 )
@@ -1606,6 +1616,7 @@ class BatchSenderApp:
                 self.base_config.update(config)
                 self.retry_count_var.set(str(config["retry_count"]))
                 self.retry_interval_var.set(self._number_text(config["retry_interval_seconds"]))
+                self.request_timeout_var.set(self._number_text(config["request_timeout_seconds"]))
                 self.max_wait_var.set(self._number_text(config["max_wait_seconds"]))
                 self.schedule_preview()
                 self._show_notice("应用设置已保存")

@@ -34,10 +34,11 @@ except ModuleNotFoundError:  # Python 3.10
 
 APP_NAME = "CC Switch Batch Sender"
 APP_TITLE = "CC Switch 批量请求"
-APP_VERSION = "2.2.5"
+APP_VERSION = "2.2.8"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".cc-switch" / "cc-switch.db"
 DIAGNOSTIC_LOG_MAX_BYTES = 512 * 1024
+REQUEST_COMPLETION_GRACE_SECONDS = 1.0
 DIAGNOSTIC_LOG_BACKUP_COUNT = 2
 CONFIG_SCHEMA_VERSION = 8
 CONFIG_SCHEMA_KEY = "schema_version"
@@ -481,7 +482,7 @@ def normalize_config(values: dict[str, Any] | None = None) -> dict[str, Any]:
         "request_count": _coerce_int(raw.get("request_count"), "请求次数"),
         "retry_count": _coerce_int(raw.get("retry_count"), "重试次数"),
         "max_output_tokens": _coerce_int(raw.get("max_output_tokens"), "最大输出 token"),
-        "request_timeout_seconds": _coerce_float(raw.get("request_timeout_seconds"), "单次超时"),
+        "request_timeout_seconds": _coerce_float(raw.get("request_timeout_seconds"), "单请求超时"),
         "max_wait_seconds": _coerce_float(raw.get("max_wait_seconds"), "总等待时间"),
         "retry_interval_seconds": _coerce_float(raw.get("retry_interval_seconds"), "重试间隔"),
         "poll_interval_seconds": _coerce_float(raw.get("poll_interval_seconds"), "轮询间隔"),
@@ -506,7 +507,7 @@ def normalize_config(values: dict[str, Any] | None = None) -> dict[str, Any]:
     if not 1 <= config["max_output_tokens"] <= 4096:
         raise SenderError("最大输出 token 必须在 1 到 4096 之间。")
     if config["request_timeout_seconds"] <= 0:
-        raise SenderError("单次超时必须大于 0。")
+        raise SenderError("单请求超时必须大于 0。")
     if config["max_wait_seconds"] < 0:
         raise SenderError("总等待时间不能小于 0。")
     if config["retry_interval_seconds"] < 0:
@@ -2207,6 +2208,8 @@ def run_batch(
     round_limit_label = "unlimited" if unlimited_retries else str(max_rounds)
     max_wait = float(config["max_wait_seconds"])
     run_deadline = started + max_wait if max_wait > 0 else None
+    sender_slots = threading.BoundedSemaphore(request_count)
+    run_threads: list[threading.Thread] = []
     launched_total = 0
     completed_total = 0
     failed_total = 0
@@ -2263,7 +2266,8 @@ def run_batch(
                 total_cap=total_cap,
                 message="已停止。",
             )
-            return RunOutcome(130, winner, launched_total, completed_total, failed_total)
+            unfinished = sum(thread.is_alive() for thread in run_threads)
+            return RunOutcome(130, winner, launched_total, completed_total, failed_total, unfinished)
         if run_deadline is not None and time.monotonic() >= run_deadline:
             logger.log("TIMEOUT reached before starting the next batch")
             no_result_message = "已达到总等待时间，没有成功响应。"
@@ -2309,8 +2313,6 @@ def run_batch(
             )
             return RunOutcome(0, None, 0, 0, 0)
 
-        now = time.monotonic()
-        round_deadline = run_deadline if run_deadline is not None else now + float(config["request_timeout_seconds"])
         logger.log(
             "BATCH_START batch=%s/%s sending=%s transport=%s provider=%s model=%s api_format=%s"
             % (
@@ -2325,19 +2327,43 @@ def run_batch(
         )
         result_queue: queue.Queue[AttemptResult] = queue.Queue()
         threads: list[threading.Thread] = []
+        request_deadlines: list[float] = []
         abort_polling = threading.Event()
 
-        def worker(number: int) -> None:
+        def worker(number: int, request_deadline: float) -> None:
+            acquired = False
             try:
+                acquired = sender_slots.acquire(blocking=False)
+                if not acquired:
+                    result_queue.put(
+                        AttemptResult(
+                            index=number,
+                            round_no=round_no,
+                            ok=False,
+                            error="请求已取消。" if abort_polling.is_set() else "发送槽位被未结束请求占用。",
+                            provider_name=provider.name,
+                            cancelled=abort_polling.is_set(),
+                        )
+                    )
+                    return
                 item = sender(
                     number,
                     provider,
                     config,
-                    round_deadline,
+                    request_deadline,
                     logger,
                     abort_polling,
                     round_no=round_no,
                 )
+                if time.monotonic() > request_deadline:
+                    item = AttemptResult(
+                        index=number,
+                        round_no=round_no,
+                        ok=False,
+                        error="单请求超时。",
+                        provider_name=provider.name,
+                        request_prompt=item.request_prompt,
+                    )
                 result_queue.put(_sanitize_attempt_result(item, provider.api_key))
             except Exception as exc:
                 result_queue.put(
@@ -2349,16 +2375,24 @@ def run_batch(
                         provider_name=provider.name,
                     )
                 )
+            finally:
+                if acquired:
+                    sender_slots.release()
 
         for number in range(1, request_count + 1):
+            request_deadline = time.monotonic() + float(config["request_timeout_seconds"])
+            if run_deadline is not None:
+                request_deadline = min(request_deadline, run_deadline)
+            request_deadlines.append(request_deadline)
             thread = threading.Thread(
                 target=worker,
-                args=(number,),
+                args=(number, request_deadline),
                 name=f"ccswitch-{transport_mode}-{round_no}-{number}",
                 daemon=True,
             )
             thread.start()
             threads.append(thread)
+            run_threads.append(thread)
         launched_total += request_count
         _emit_progress(
             on_progress,
@@ -2374,12 +2408,17 @@ def run_batch(
         )
 
         completed_in_round = 0
+        completed_indices: set[int] = set()
         round_results: list[AttemptResult] = []
         timed_out = False
+        total_wait_expired = False
         stop_noted = False
+        stop_guard_deadline: float | None = None
+        request_guard_deadline = max(request_deadlines) + REQUEST_COMPLETION_GRACE_SECONDS
         while completed_in_round < request_count:
             if stop_event.is_set() and not stop_noted:
                 stop_noted = True
+                stop_guard_deadline = time.monotonic() + REQUEST_COMPLETION_GRACE_SECONDS
                 abort_polling.set()
                 logger.log("STOPPING no new batch will be started; waiting for dispatched requests")
                 _emit_progress(
@@ -2395,9 +2434,19 @@ def run_batch(
                     round_size=request_count,
                     message="正在等待已发送请求结束。",
                 )
-            remaining = round_deadline - time.monotonic()
+            collector_deadline = request_guard_deadline
+            if run_deadline is not None:
+                collector_deadline = min(collector_deadline, run_deadline)
+            if stop_guard_deadline is not None:
+                collector_deadline = min(collector_deadline, stop_guard_deadline)
+            remaining = collector_deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
+                total_wait_expired = (
+                    run_deadline is not None
+                    and run_deadline <= request_guard_deadline
+                    and (stop_guard_deadline is None or run_deadline <= stop_guard_deadline)
+                )
                 abort_polling.set()
                 break
             try:
@@ -2405,6 +2454,7 @@ def run_batch(
             except queue.Empty:
                 continue
             round_results.append(item)
+            completed_indices.add(item.index)
             completed_in_round += 1
             completed_total += 1
             if item.ok:
@@ -2458,32 +2508,81 @@ def run_batch(
             )
 
         if timed_out:
+            join_deadline = time.monotonic() + REQUEST_COMPLETION_GRACE_SECONDS
             for thread in threads:
-                thread.join(timeout=1.0)
-            unfinished = sum(thread.is_alive() for thread in threads)
-            logger.log(
-                "TIMEOUT batch=%s completed=%s requested=%s unfinished=%s"
-                % (round_no, completed_in_round, request_count, unfinished)
-            )
-            _emit_progress(
-                on_progress,
-                kind="timeout",
-                round_no=round_no,
-                max_rounds=max_rounds,
-                launched_total=launched_total,
-                completed_total=completed_total,
-                failed_total=failed_total,
-                total_cap=total_cap,
-                completed_in_round=completed_in_round,
-                round_size=request_count,
-                winner=winner,
-                message="已达到总等待时间。",
-                unfinished=unfinished,
-            )
-            return RunOutcome(0 if winner else 1, winner, launched_total, completed_total, failed_total, unfinished)
+                remaining = join_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                thread.join(timeout=remaining)
+            run_threads[:] = [thread for thread in run_threads if thread.is_alive()]
+            stopped = stop_event.is_set()
+            if stopped or total_wait_expired:
+                unfinished = sum(thread.is_alive() for thread in run_threads)
+                timeout_reason = "stopped" if stopped else "total_wait"
+                timeout_message = "已停止等待，但仍有请求未结束。" if stopped else "已达到总等待时间。"
+                logger.log(
+                    "TIMEOUT reason=%s batch=%s completed=%s requested=%s unfinished=%s"
+                    % (timeout_reason, round_no, completed_in_round, request_count, unfinished)
+                )
+                _emit_progress(
+                    on_progress,
+                    kind="timeout",
+                    round_no=round_no,
+                    max_rounds=max_rounds,
+                    launched_total=launched_total,
+                    completed_total=completed_total,
+                    failed_total=failed_total,
+                    total_cap=total_cap,
+                    completed_in_round=completed_in_round,
+                    round_size=request_count,
+                    winner=winner,
+                    message=timeout_message,
+                    unfinished=unfinished,
+                )
+                return_code = 0 if winner else (130 if stopped else 1)
+                return RunOutcome(return_code, winner, launched_total, completed_total, failed_total, unfinished)
 
+            for number in range(1, request_count + 1):
+                if number in completed_indices:
+                    continue
+                item = AttemptResult(
+                    index=number,
+                    round_no=round_no,
+                    ok=False,
+                    error="单请求超时：请求线程在截止时间后仍未结束。",
+                    provider_name=provider.name,
+                )
+                round_results.append(item)
+                completed_in_round += 1
+                completed_total += 1
+                failed_total += 1
+                logger.log(
+                    "REQUEST_TIMEOUT batch=%s request=%s reason=worker_unfinished"
+                    % (round_no, number)
+                )
+                _emit_progress(
+                    on_progress,
+                    kind="request_complete",
+                    round_no=round_no,
+                    max_rounds=max_rounds,
+                    request_index=number,
+                    launched_total=launched_total,
+                    completed_total=completed_total,
+                    failed_total=failed_total,
+                    total_cap=total_cap,
+                    completed_in_round=completed_in_round,
+                    round_size=request_count,
+                    winner=winner,
+                    message=item.error,
+                )
+
+        join_deadline = time.monotonic() + 0.2
         for thread in threads:
-            thread.join(timeout=0.2)
+            remaining = join_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+        run_threads[:] = [thread for thread in run_threads if thread.is_alive()]
         logger.log(
             "BATCH_COMPLETE batch=%s completed=%s requested=%s success=%s"
             % (round_no, completed_in_round, request_count, bool(winner))
@@ -2507,10 +2606,39 @@ def run_batch(
                 "RUN_END code=0 launched=%s completed=%s failed=%s"
                 % (launched_total, completed_total, failed_total)
             )
-            return RunOutcome(0, winner, launched_total, completed_total, failed_total)
+            unfinished = sum(thread.is_alive() for thread in run_threads)
+            return RunOutcome(0, winner, launched_total, completed_total, failed_total, unfinished)
         if stop_event.is_set():
             logger.log("STOPPED by user")
-            return RunOutcome(130, None, launched_total, completed_total, failed_total)
+            unfinished = sum(thread.is_alive() for thread in run_threads)
+            return RunOutcome(130, None, launched_total, completed_total, failed_total, unfinished)
+        if unlimited_retries and len(run_threads) >= request_count:
+            message = "所有发送槽位均被未结束请求占用，正在等待或可手动停止。"
+            logger.log("RUN_WAIT active_workers=%s request_count=%s" % (len(run_threads), request_count))
+            _emit_progress(
+                on_progress,
+                kind="retry_wait",
+                round_no=round_no,
+                max_rounds=max_rounds,
+                launched_total=launched_total,
+                completed_total=completed_total,
+                failed_total=failed_total,
+                total_cap=total_cap,
+                completed_in_round=completed_in_round,
+                round_size=request_count,
+                winner=winner,
+                message=message,
+                unfinished=len(run_threads),
+            )
+            while len(run_threads) >= request_count:
+                remaining = None if run_deadline is None else run_deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    break
+                wait_timeout = 0.25 if remaining is None else min(0.25, remaining)
+                if stop_event.wait(wait_timeout):
+                    logger.log("STOPPED while waiting for a sender slot")
+                    return RunOutcome(130, None, launched_total, completed_total, failed_total, len(run_threads))
+                run_threads[:] = [thread for thread in run_threads if thread.is_alive()]
         if _all_failures_are_non_retryable(round_results):
             logger.log("HARD_FAIL all responses indicate a non-retryable request/configuration error")
             no_result_message = "请求或配置错误不可重试。"
@@ -2539,7 +2667,8 @@ def run_batch(
         )
         if stop_event.wait(interval):
             logger.log("STOPPED during retry wait")
-            return RunOutcome(130, None, launched_total, completed_total, failed_total)
+            unfinished = sum(thread.is_alive() for thread in run_threads)
+            return RunOutcome(130, None, launched_total, completed_total, failed_total, unfinished)
 
     logger.log(
         "NO_RESULT launched=%s completed=%s failed=%s batches=%s"
@@ -2556,7 +2685,8 @@ def run_batch(
         total_cap=total_cap,
         message=no_result_message,
     )
-    return RunOutcome(1, None, launched_total, completed_total, failed_total)
+    unfinished = sum(thread.is_alive() for thread in run_threads)
+    return RunOutcome(1, None, launched_total, completed_total, failed_total, unfinished)
 
 
 def launch_gui(
