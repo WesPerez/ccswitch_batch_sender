@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import gzip
 import os
 import random
 import sqlite3
@@ -901,6 +902,128 @@ class ProtocolTests(unittest.TestCase):
         invalid, _ = sender.validate_probe_response("{}", probe)
         self.assertFalse(invalid)
 
+    def test_extract_text_handles_nested_responses_output_text_value(self) -> None:
+        payload = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": {"value": '{"sum":9,"parity":"odd"}'},
+                        }
+                    ],
+                }
+            ]
+        }
+        self.assertEqual(sender._extract_text(payload), '{"sum":9,"parity":"odd"}')
+
+    def test_failed_request_log_includes_bounded_response_summary(self) -> None:
+        log_lines: list[str] = []
+
+        def fake_sender(index, provider, config, deadline, logger, abort_polling, *, round_no=1):
+            return sender.AttemptResult(
+                index=index,
+                round_no=round_no,
+                ok=False,
+                status=200,
+                text="gateway answer",
+                payload={"output_text": "gateway answer", "details": "x" * 5000},
+                provider_name=provider.name,
+            )
+
+        outcome = sender.run_batch(
+            sender.normalize_config(
+                {
+                    "request_count": 1,
+                    "retry_count": 1,
+                    "request_timeout_seconds": 1,
+                    "max_wait_seconds": 1,
+                    "retry_interval_seconds": 0,
+                }
+            ),
+            sender.RunLogger(callback=log_lines.append),
+            provider_loader=lambda _config: self.provider,
+            sender=fake_sender,
+        )
+
+        self.assertEqual(outcome.code, 1)
+        failure_lines = [line for line in log_lines if "REQUEST_FAIL" in line]
+        self.assertEqual(len(failure_lines), 2)
+        self.assertTrue(all("response=" in line for line in failure_lines))
+        self.assertTrue(all("gateway answer" in line for line in failure_lines))
+        self.assertTrue(all(len(line) < 2200 for line in failure_lines))
+
+    def test_http_request_decompresses_gzip_response(self) -> None:
+        expected = {"output_text": '{"sum":9,"parity":"odd"}'}
+        response = mock.MagicMock()
+        response.status = 200
+        response.headers = {
+            "Content-Encoding": "gzip",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        response.read.return_value = gzip.compress(json.dumps(expected).encode("utf-8"))
+        response.__enter__.return_value = response
+
+        with mock.patch.object(sender.urllib.request, "urlopen", return_value=response):
+            status, payload, headers, error = sender._http_request(
+                "POST",
+                "https://api.example.test/responses",
+                {"input": "probe"},
+                self.provider,
+                sender.normalize_config(),
+                5,
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, expected)
+        self.assertEqual(headers["Content-Encoding"], "gzip")
+        self.assertEqual(error, "")
+
+    def test_http_request_detects_gzip_magic_without_header(self) -> None:
+        expected = {"output_text": '{"sum":9,"parity":"odd"}'}
+        response = mock.MagicMock()
+        response.status = 200
+        response.headers = {"Content-Type": "application/json"}
+        response.read.return_value = gzip.compress(json.dumps(expected).encode("utf-8"))
+        response.__enter__.return_value = response
+
+        with mock.patch.object(sender.urllib.request, "urlopen", return_value=response):
+            status, payload, _headers, error = sender._http_request(
+                "POST",
+                "https://api.example.test/responses",
+                {"input": "probe"},
+                self.provider,
+                sender.normalize_config(),
+                5,
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, expected)
+        self.assertEqual(error, "")
+
+    def test_http_request_reports_invalid_compressed_response(self) -> None:
+        response = mock.MagicMock()
+        response.status = 200
+        response.headers = {"Content-Encoding": "gzip"}
+        response.read.return_value = b"not-gzip"
+        response.__enter__.return_value = response
+
+        with mock.patch.object(sender.urllib.request, "urlopen", return_value=response):
+            status, payload, headers, error = sender._http_request(
+                "POST",
+                "https://api.example.test/responses",
+                {"input": "probe"},
+                self.provider,
+                sender.normalize_config(),
+                5,
+            )
+
+        self.assertEqual(status, 200)
+        self.assertIsNone(payload)
+        self.assertEqual(headers["Content-Encoding"], "gzip")
+        self.assertIn("响应解压或解码失败", error)
+
     def test_request_headers_use_captured_codex_exec_compatibility_identity(self) -> None:
         headers = sender.build_request_headers(
             self.provider,
@@ -1103,11 +1226,83 @@ class ProtocolTests(unittest.TestCase):
         self.assertNotIn(self.provider.api_key, rendered)
         self.assertIn("<redacted>", rendered)
 
-    def test_endpoint_candidates_keep_existing_fallback_order(self) -> None:
+    def test_endpoint_candidates_prefer_standard_openai_path(self) -> None:
         self.assertEqual(
             sender.endpoint_candidates(self.provider, "auto"),
-            ["https://api.example.test/responses", "https://api.example.test/v1/responses"],
+            ["https://api.example.test/v1/responses", "https://api.example.test/responses"],
         )
+
+    def test_send_one_falls_back_when_first_endpoint_returns_html(self) -> None:
+        probe = sender.ProbeCase(prompt="自然任务", expected={"sum": 9, "parity": "odd"})
+        config = sender.normalize_config({"random_probe_enabled": True})
+        responses = [
+            (200, "<html><script>var arg1='challenge'</script></html>", {"Content-Type": "text/html"}, ""),
+            (200, {"output_text": '{"sum":9,"parity":"odd"}'}, {"Content-Type": "application/json"}, ""),
+        ]
+        with mock.patch.object(sender, "generate_probe_case", return_value=probe), mock.patch.object(
+            sender,
+            "endpoint_candidates",
+            return_value=[
+                "https://api.example.test/responses",
+                "https://api.example.test/v1/responses",
+            ],
+        ), mock.patch.object(sender, "_http_request", side_effect=responses) as request:
+            result = sender.send_one(
+                1,
+                self.provider,
+                config,
+                time.monotonic() + 5,
+                sender.RunLogger(callback=lambda _line: None),
+            )
+
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.endpoint, "https://api.example.test/v1/responses")
+        self.assertEqual(request.call_count, 2)
+
+    def test_plain_html_is_not_mislabeled_as_a_security_challenge(self) -> None:
+        error = sender._html_response_error(
+            "<html><script>console.log('maintenance')</script></html>",
+            {"Content-Type": "text/html"},
+        )
+
+        self.assertEqual(error, "上游返回 HTML 页面，不是 API 响应。")
+
+    def test_html_challenge_is_non_retryable_after_all_endpoints_fail(self) -> None:
+        probe = sender.ProbeCase(prompt="自然任务", expected={"sum": 9, "parity": "odd"})
+        config = sender.normalize_config(
+            {
+                "request_count": 1,
+                "retry_count": 0,
+                "request_timeout_seconds": 1,
+                "max_wait_seconds": 0,
+            }
+        )
+        log_lines: list[str] = []
+        html_response = (
+            200,
+            "<html><script>var arg1='challenge'</script></html>",
+            {"Content-Type": "text/html"},
+            "",
+        )
+        with mock.patch.object(sender, "generate_probe_case", return_value=probe), mock.patch.object(
+            sender,
+            "_http_request",
+            side_effect=[html_response, html_response],
+        ) as request:
+            outcome = sender.run_batch(
+                config,
+                sender.RunLogger(callback=log_lines.append),
+                provider_loader=lambda _config: self.provider,
+            )
+
+        self.assertEqual(outcome.code, 1)
+        self.assertEqual(outcome.launched, 1)
+        self.assertEqual(request.call_count, 2)
+        self.assertTrue(any("HARD_FAIL" in line for line in log_lines))
+        self.assertFalse(any("RETRY_WAIT" in line for line in log_lines))
+        failure_line = next(line for line in log_lines if "REQUEST_FAIL" in line)
+        self.assertIn("HTML 安全挑战页", failure_line)
+        self.assertEqual(failure_line.count("var arg1="), 1)
 
     def test_result_export_redacts_query_string(self) -> None:
         result = sender.AttemptResult(

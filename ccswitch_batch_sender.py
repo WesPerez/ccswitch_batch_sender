@@ -5,6 +5,7 @@ import copy
 import ctypes
 import datetime as dt
 import functools
+import gzip
 import itertools
 import json
 import os
@@ -22,6 +23,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -34,7 +36,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 APP_NAME = "CC Switch Batch Sender"
 APP_TITLE = "CC Switch 批量请求"
-APP_VERSION = "2.2.8"
+APP_VERSION = "2.2.10"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".cc-switch" / "cc-switch.db"
 DIAGNOSTIC_LOG_MAX_BYTES = 512 * 1024
@@ -169,6 +171,7 @@ class AttemptResult:
     pending: bool = False
     cancelled: bool = False
     response_headers: dict[str, str] = field(default_factory=dict)
+    retryable: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -1142,7 +1145,7 @@ def endpoint_candidates(provider: Provider, style: str) -> list[str]:
             if style == "openai"
             else [base + "/responses"]
             if style == "ccswitch"
-            else [base + "/responses", openai_endpoint]
+            else [openai_endpoint, base + "/responses"]
         )
     else:
         if base.endswith("/chat/completions"):
@@ -1834,11 +1837,79 @@ def _sanitize_attempt_result(result: AttemptResult, secret: str) -> AttemptResul
     return result
 
 
+def _bounded_log_value(value: Any, *, limit: int = 900) -> str:
+    if isinstance(value, (dict, list)):
+        try:
+            rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            rendered = repr(value)
+    else:
+        rendered = "" if value is None else str(value)
+    return rendered.replace("\r", " ").replace("\n", " ")[:limit]
+
+
+def _response_log_summary(result: AttemptResult) -> str:
+    payload = result.payload
+    if isinstance(payload, str) and payload.strip() == result.text.strip():
+        payload = "<same-as-text>"
+    return "text=%s payload=%s" % (
+        _bounded_log_value(result.text),
+        _bounded_log_value(payload),
+    )
+
+
 def _json_or_text(raw: str) -> Any:
     try:
         return json.loads(raw) if raw else {}
     except json.JSONDecodeError:
         return raw
+
+
+def _html_response_error(payload: Any, headers: dict[str, str]) -> str:
+    if not isinstance(payload, str):
+        return ""
+    content_type = _header_value(headers, "Content-Type").lower()
+    prefix = payload.lstrip()[:500].lower()
+    is_html = "text/html" in content_type or prefix.startswith(("<!doctype html", "<html", "<script"))
+    if not is_html:
+        return ""
+    challenge_markers = ("var arg1=", "document.cookie", "challenge")
+    if any(marker in prefix for marker in challenge_markers):
+        return "上游返回 HTML 安全挑战页，不是 API 响应。"
+    return "上游返回 HTML 页面，不是 API 响应。"
+
+
+def _header_value(headers: Any, name: str) -> str:
+    if headers is None:
+        return ""
+    try:
+        value = headers.get(name, "")
+    except AttributeError:
+        return ""
+    return str(value or "")
+
+
+def _decode_http_body(data: bytes, headers: Any) -> str:
+    encoding = _header_value(headers, "Content-Encoding").split(",", 1)[0].strip().lower()
+    if encoding == "gzip" or data.startswith(b"\x1f\x8b"):
+        data = gzip.decompress(data)
+    elif encoding == "deflate":
+        try:
+            data = zlib.decompress(data)
+        except zlib.error:
+            data = zlib.decompress(data, -zlib.MAX_WBITS)
+    elif encoding not in {"", "identity"}:
+        raise OSError(f"不支持的响应压缩格式：{encoding}")
+
+    content_type = _header_value(headers, "Content-Type")
+    match = re.search(r"charset\s*=\s*['\"]?([^;'\"\s]+)", content_type, flags=re.IGNORECASE)
+    charset = match.group(1) if match else "utf-8"
+    try:
+        return data.decode(charset)
+    except LookupError:
+        return data.decode("utf-8", errors="replace")
+    except UnicodeDecodeError:
+        return data.decode(charset, errors="replace")
 
 
 def _extract_text(payload: Any) -> str:
@@ -1847,24 +1918,28 @@ def _extract_text(payload: Any) -> str:
     if not isinstance(payload, dict):
         return ""
     output_text = payload.get("output_text")
-    if isinstance(output_text, str) and output_text.strip():
-        return output_text.strip()
+    output_text_value = _text_fragment(output_text)
+    if output_text_value:
+        return output_text_value
     choices = payload.get("choices")
     if isinstance(choices, list) and choices:
         first = choices[0] if isinstance(choices[0], dict) else {}
         message = first.get("message") if isinstance(first, dict) else {}
         if isinstance(message, dict):
             content = message.get("content")
+            content_value = _text_fragment(content)
+            if content_value:
+                return content_value
             if isinstance(content, str) and content.strip():
                 return content.strip()
             if isinstance(content, list):
-                parts = [part.get("text", "") for part in content if isinstance(part, dict)]
-                text = "".join(part for part in parts if isinstance(part, str)).strip()
+                parts = [_text_fragment(part.get("text", part)) for part in content if isinstance(part, dict)]
+                text = "".join(part for part in parts if part).strip()
                 if text:
                     return text
-        text = first.get("text") if isinstance(first, dict) else ""
-        if isinstance(text, str) and text.strip():
-            return text.strip()
+        text = _text_fragment(first.get("text") if isinstance(first, dict) else "")
+        if text:
+            return text
     output = payload.get("output")
     if isinstance(output, list):
         parts: list[str] = []
@@ -1874,11 +1949,28 @@ def _extract_text(payload: Any) -> str:
             content = item.get("content")
             if isinstance(content, list):
                 for part in content:
-                    if isinstance(part, dict) and isinstance(part.get("text"), str):
-                        parts.append(part["text"])
+                    if isinstance(part, dict):
+                        fragment = _text_fragment(part.get("text", part))
+                        if fragment:
+                            parts.append(fragment)
+            else:
+                fragment = _text_fragment(item.get("text", content))
+                if fragment:
+                    parts.append(fragment)
         text = "".join(parts).strip()
         if text:
             return text
+    return ""
+
+
+def _text_fragment(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("value", "text"):
+            nested = value.get(key)
+            if isinstance(nested, str) and nested.strip():
+                return nested.strip()
     return ""
 
 
@@ -1904,14 +1996,17 @@ def _http_request(
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = _redact_secret_text(response.read().decode("utf-8", errors="replace"), provider.api_key)
             response_headers = {
                 str(key): _redact_secret_text(str(value), provider.api_key)
                 for key, value in response.headers.items()
             }
+            try:
+                raw = _redact_secret_text(_decode_http_body(response.read(), response.headers), provider.api_key)
+            except (OSError, EOFError, zlib.error) as exc:
+                error = _redact_secret_text(f"响应解压或解码失败：{exc}", provider.api_key)
+                return response.status, None, response_headers, error
             return response.status, _json_or_text(raw), response_headers, ""
     except urllib.error.HTTPError as exc:
-        raw = _redact_secret_text(exc.read().decode("utf-8", errors="replace")[:2000], provider.api_key)
         response_headers = (
             {
                 str(key): _redact_secret_text(str(value), provider.api_key)
@@ -1920,6 +2015,11 @@ def _http_request(
             if exc.headers
             else {}
         )
+        try:
+            raw = _redact_secret_text(_decode_http_body(exc.read(), exc.headers)[:2000], provider.api_key)
+        except (OSError, EOFError, zlib.error) as decode_exc:
+            error = _redact_secret_text(f"响应解压或解码失败：{decode_exc}", provider.api_key)
+            return exc.code, None, response_headers, error
         return exc.code, _json_or_text(raw), response_headers, raw
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         return None, None, {}, _redact_secret_text(str(exc), provider.api_key)
@@ -2027,16 +2127,29 @@ def send_one(
     last_status: int | None = None
     last_payload: Any = None
     last_endpoint = ""
-    for endpoint in endpoint_candidates(provider, str(config["endpoint_style"])):
+    last_headers: dict[str, str] = {}
+    saw_html_response = False
+    all_endpoint_failures_are_html = True
+    candidates = endpoint_candidates(provider, str(config["endpoint_style"]))
+    attempted_endpoints = 0
+    for endpoint in candidates:
         timeout = _request_timeout(config, deadline)
         if timeout <= 0:
             last_error = "请求未发送：已到达本轮截止时间。"
             break
+        attempted_endpoints += 1
         last_endpoint = endpoint
         status, payload, headers, error = _http_request("POST", endpoint, body, provider, config, timeout)
         last_status = status
         last_payload = payload
+        last_headers = headers
         latency_ms = int((time.monotonic() - started) * 1000)
+        html_error = _html_response_error(payload, headers)
+        if html_error:
+            saw_html_response = True
+            last_error = html_error
+            continue
+        all_endpoint_failures_are_html = False
         if status is not None and 200 <= status < 300:
             if isinstance(payload, dict) and payload.get("error"):
                 return AttemptResult(
@@ -2119,6 +2232,12 @@ def send_one(
         payload=last_payload,
         provider_name=provider.name,
         request_prompt=request_prompt,
+        response_headers=last_headers,
+        retryable=(
+            False
+            if saw_html_response and all_endpoint_failures_are_html and attempted_endpoints == len(candidates)
+            else None
+        ),
     )
 
 
@@ -2169,9 +2288,10 @@ def _emit_progress(callback: Callable[[ProgressEvent], None] | None, **kwargs: A
 def _all_failures_are_non_retryable(results: list[AttemptResult]) -> bool:
     if not results:
         return False
-    statuses = [item.status for item in results]
-    return all(status in {400, 401, 403, 404, 405, 422} for status in statuses if status is not None) and all(
-        status is not None for status in statuses
+    return all(
+        item.retryable is False
+        or (item.retryable is None and item.status in {400, 401, 403, 404, 405, 422})
+        for item in results
     )
 
 
@@ -2464,7 +2584,7 @@ def run_batch(
                     if transport_mode == TRANSPORT_CODEX_CLI:
                         terminate_active_codex_processes()
                     logger.log(
-                        "FIRST_RESULT batch=%s request=%s status=%s latency_ms=%s prompt=%s text=%s"
+                        "FIRST_RESULT batch=%s request=%s status=%s latency_ms=%s prompt=%s text=%s response=%s"
                         % (
                             item.round_no,
                             item.index,
@@ -2476,20 +2596,27 @@ def run_batch(
                                 else "<fixed-or-custom>"
                             ),
                             item.text[:1000],
+                            _response_log_summary(item),
                         )
                     )
                     if on_winner is not None:
                         on_winner(item)
             elif item.cancelled:
                 logger.log(
-                    "REQUEST_CANCELLED batch=%s request=%s reason=%s"
-                    % (item.round_no, item.index, item.error[:500])
+                    "REQUEST_CANCELLED batch=%s request=%s reason=%s response=%s"
+                    % (item.round_no, item.index, item.error[:500], _response_log_summary(item))
                 )
             else:
                 failed_total += 1
                 logger.log(
-                    "REQUEST_FAIL batch=%s request=%s status=%s error=%s"
-                    % (item.round_no, item.index, item.status or "", item.error[:500])
+                    "REQUEST_FAIL batch=%s request=%s status=%s error=%s response=%s"
+                    % (
+                        item.round_no,
+                        item.index,
+                        item.status or "",
+                        item.error[:500],
+                        _response_log_summary(item),
+                    )
                 )
             _emit_progress(
                 on_progress,

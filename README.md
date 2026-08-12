@@ -14,6 +14,8 @@
 - 可编辑固定提示词、每批请求次数、额外批次重试次数、重试间隔、模型/地址覆盖、超时、Endpoint 模式和输出 token；重试次数为 `0` 时持续重试。
 - 官方 CLI 模式展示任务摘要，实际请求头和请求体由 Codex CLI 生成；直接 API 模式展示实际 JSON，并可切换为自定义 JSON。
 - 展示有限发送上限或无限重试状态、批次进度、完成/失败数、首个成功响应、耗时和完整运行日志。
+- 运行日志会对失败、取消和首个成功请求记录限长且脱敏的响应摘要，便于判断上游实际返回格式。
+- 自动 Endpoint 模式优先标准 `/v1/responses`；若候选地址返回 HTML 页面会继续尝试备用地址，全部返回 HTML 时停止无意义重试并明确报错。
 - 默认在 `%LOCALAPPDATA%\CCSwitchBatchSender\settings.json` 生成可读 JSON 配置；运行结果和完整请求日志只在应用内保留，需要时由用户显式导出。
 - 默认在 `%LOCALAPPDATA%\CCSwitchBatchSender\logs\provider-diagnostics.jsonl` 保留容量受限的 provider 解析诊断，只记录指针、provider ID、快照状态、凭据来源类型和结果，不记录 API Key、URL、请求体或响应内容。
 - 默认设置保存在当前用户文件 `%LOCALAPPDATA%\CCSwitchBatchSender\settings.json`，不保存 API Key。升级时会先写入该文件，再删除旧版 `HKCU\Software\CCSwitchBatchSender` 注册表键。
