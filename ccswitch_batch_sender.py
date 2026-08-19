@@ -6,6 +6,7 @@ import ctypes
 import datetime as dt
 import functools
 import gzip
+import http.client
 import itertools
 import json
 import os
@@ -14,6 +15,7 @@ import queue
 import random
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -36,13 +38,14 @@ except ModuleNotFoundError:  # Python 3.10
 
 APP_NAME = "CC Switch Batch Sender"
 APP_TITLE = "CC Switch 批量请求"
-APP_VERSION = "2.2.10"
+APP_VERSION = "2.3.1"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".cc-switch" / "cc-switch.db"
 DIAGNOSTIC_LOG_MAX_BYTES = 512 * 1024
 REQUEST_COMPLETION_GRACE_SECONDS = 1.0
+SUCCESS_CANCELLATION_GRACE_SECONDS = 1.0
 DIAGNOSTIC_LOG_BACKUP_COUNT = 2
-CONFIG_SCHEMA_VERSION = 8
+CONFIG_SCHEMA_VERSION = 9
 CONFIG_SCHEMA_KEY = "schema_version"
 CONFIG_SETTINGS_KEY = "settings"
 MAX_FINITE_RETRY_COUNT = 2_147_483_647
@@ -80,6 +83,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_wait_seconds": 0,
     "retry_interval_seconds": 3,
     "poll_interval_seconds": 2,
+    "success_keepalive_enabled": True,
+    "success_keepalive_interval_seconds": 180,
     "db_path": "",
     "endpoint_style": "auto",
     "unique_prompt_cache_key": True,
@@ -102,6 +107,8 @@ PERSISTED_KEYS = (
     "max_wait_seconds",
     "retry_interval_seconds",
     "poll_interval_seconds",
+    "success_keepalive_enabled",
+    "success_keepalive_interval_seconds",
     "endpoint_style",
     "unique_prompt_cache_key",
     "save_full_response",
@@ -172,6 +179,7 @@ class AttemptResult:
     cancelled: bool = False
     response_headers: dict[str, str] = field(default_factory=dict)
     retryable: bool | None = None
+    completed_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -189,6 +197,11 @@ class ProgressEvent:
     winner: AttemptResult | None = None
     message: str = ""
     unfinished: int = 0
+    keepalive_sequence: int = 0
+    keepalive_successes: int = 0
+    keepalive_failures: int = 0
+    next_run_at: float = 0.0
+    result: AttemptResult | None = None
 
 
 @dataclass(frozen=True)
@@ -199,6 +212,14 @@ class RunOutcome:
     completed: int
     failed: int
     unfinished: int = 0
+
+
+@dataclass(frozen=True)
+class KeepaliveOutcome:
+    sent: int
+    succeeded: int
+    failed: int
+    stopped: bool
 
 
 def _console_print(message: str, *, error: bool = False) -> None:
@@ -221,16 +242,16 @@ class RunLogger:
             self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def log(self, message: str) -> None:
-        stamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
-        line = f"[{stamp}] {message}"
         with self._lock:
+            stamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+            line = f"[{stamp}] {message}"
             if self.path is not None:
                 with self.path.open("a", encoding="utf-8") as handle:
                     handle.write(line + "\n")
-        if self._callback is not None:
-            self._callback(line)
-        elif self.path is None:
-            _console_print(line)
+            if self._callback is not None:
+                self._callback(line)
+            elif self.path is None:
+                _console_print(line)
 
 
 def default_app_data_dir() -> Path:
@@ -489,6 +510,10 @@ def normalize_config(values: dict[str, Any] | None = None) -> dict[str, Any]:
         "max_wait_seconds": _coerce_float(raw.get("max_wait_seconds"), "总等待时间"),
         "retry_interval_seconds": _coerce_float(raw.get("retry_interval_seconds"), "重试间隔"),
         "poll_interval_seconds": _coerce_float(raw.get("poll_interval_seconds"), "轮询间隔"),
+        "success_keepalive_enabled": bool(raw.get("success_keepalive_enabled", True)),
+        "success_keepalive_interval_seconds": _coerce_float(
+            raw.get("success_keepalive_interval_seconds"), "成功后保持间隔"
+        ),
         "db_path": str(raw.get("db_path", "")).strip(),
         "endpoint_style": str(raw.get("endpoint_style", "auto")).strip().lower(),
         "unique_prompt_cache_key": bool(raw.get("unique_prompt_cache_key", True)),
@@ -517,6 +542,10 @@ def normalize_config(values: dict[str, Any] | None = None) -> dict[str, Any]:
         raise SenderError("重试间隔不能小于 0。")
     if config["poll_interval_seconds"] <= 0:
         raise SenderError("轮询间隔必须大于 0。")
+    if config["success_keepalive_interval_seconds"] < 60:
+        raise SenderError("成功后保持间隔不能小于 60 秒。")
+    if config["success_keepalive_interval_seconds"] > 86_400:
+        raise SenderError("成功后保持间隔不能超过 86400 秒。")
     if config["endpoint_style"] not in {"auto", "ccswitch", "openai"}:
         raise SenderError("Endpoint 模式只能是 auto、ccswitch 或 openai。")
 
@@ -604,6 +633,14 @@ def migrate_saved_config(values: dict[str, Any], schema_version: int) -> dict[st
             migrated["retry_count"] = DEFAULT_CONFIG["retry_count"]
         if migrated.get("max_wait_seconds") in {None, 7200, 7200.0, "7200"}:
             migrated["max_wait_seconds"] = DEFAULT_CONFIG["max_wait_seconds"]
+    if schema_version < 9:
+        migrated.setdefault(
+            "success_keepalive_enabled", DEFAULT_CONFIG["success_keepalive_enabled"]
+        )
+        migrated.setdefault(
+            "success_keepalive_interval_seconds",
+            DEFAULT_CONFIG["success_keepalive_interval_seconds"],
+        )
     return migrated
 
 
@@ -1983,6 +2020,141 @@ def _is_pending(payload: Any, status: int) -> bool:
     return False
 
 
+class _RequestSocketRegistry:
+    """Track sockets opened by one request so cancellation can close them."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sockets: set[Any] = set()
+
+    def add(self, value: Any) -> None:
+        if value is None:
+            return
+        with self._lock:
+            self._sockets.add(value)
+
+    def remove(self, value: Any) -> None:
+        if value is None:
+            return
+        with self._lock:
+            self._sockets.discard(value)
+
+    def close_all(self) -> None:
+        with self._lock:
+            sockets = list(self._sockets)
+            self._sockets.clear()
+        for value in sockets:
+            try:
+                shutdown = getattr(value, "shutdown", None)
+                if callable(shutdown):
+                    shutdown(socket.SHUT_RDWR)
+            except (OSError, ValueError):
+                pass
+            try:
+                value.close()
+            except (OSError, ValueError):
+                pass
+
+
+class _AbortableHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args: Any, abort_event: threading.Event | None = None, registry: _RequestSocketRegistry | None = None, **kwargs: Any) -> None:
+        self._abort_event = abort_event
+        self._socket_registry = registry
+        super().__init__(*args, **kwargs)
+
+    def connect(self) -> None:
+        super().connect()
+        if self._socket_registry is not None:
+            self._socket_registry.add(self.sock)
+        if self._abort_event is not None and self._abort_event.is_set():
+            self.close()
+
+    def close(self) -> None:
+        value = self.sock
+        try:
+            super().close()
+        finally:
+            if self._socket_registry is not None:
+                self._socket_registry.remove(value)
+
+
+class _AbortableHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args: Any, abort_event: threading.Event | None = None, registry: _RequestSocketRegistry | None = None, **kwargs: Any) -> None:
+        self._abort_event = abort_event
+        self._socket_registry = registry
+        super().__init__(*args, **kwargs)
+
+    def connect(self) -> None:
+        super().connect()
+        if self._socket_registry is not None:
+            self._socket_registry.add(self.sock)
+        if self._abort_event is not None and self._abort_event.is_set():
+            self.close()
+
+    def close(self) -> None:
+        value = self.sock
+        try:
+            super().close()
+        finally:
+            if self._socket_registry is not None:
+                self._socket_registry.remove(value)
+
+
+class _AbortableHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, abort_event: threading.Event, registry: _RequestSocketRegistry) -> None:
+        super().__init__()
+        self._abort_event = abort_event
+        self._socket_registry = registry
+
+    def http_open(self, req: urllib.request.Request) -> Any:
+        return self.do_open(
+            lambda host, **kwargs: _AbortableHTTPConnection(
+                host,
+                abort_event=self._abort_event,
+                registry=self._socket_registry,
+                **kwargs,
+            ),
+            req,
+        )
+
+
+class _AbortableHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, abort_event: threading.Event, registry: _RequestSocketRegistry) -> None:
+        super().__init__()
+        self._abort_event = abort_event
+        self._socket_registry = registry
+
+    def https_open(self, req: urllib.request.Request) -> Any:
+        return self.do_open(
+            lambda host, **kwargs: _AbortableHTTPSConnection(
+                host,
+                abort_event=self._abort_event,
+                registry=self._socket_registry,
+                **kwargs,
+            ),
+            req,
+            context=self._context,
+            check_hostname=self._check_hostname,
+        )
+
+
+def _close_request_sockets_on_abort(
+    abort_event: threading.Event,
+    registry: _RequestSocketRegistry,
+    done_event: threading.Event,
+) -> None:
+    while not done_event.wait(0.05):
+        if abort_event.is_set():
+            registry.close_all()
+            return
+
+
+def _http_response_transport(response: Any) -> Any:
+    fp = getattr(response, "fp", None)
+    raw = getattr(fp, "raw", None)
+    return raw or fp
+
+
 def _http_request(
     method: str,
     url: str,
@@ -1990,23 +2162,61 @@ def _http_request(
     provider: Provider,
     config: dict[str, Any],
     timeout: float,
+    abort_event: threading.Event | None = None,
 ) -> tuple[int | None, Any, dict[str, str], str]:
     headers = build_request_headers(provider, config)
     data = None if body is None else json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    if abort_event is not None and abort_event.is_set():
+        return None, None, {}, "请求已取消。"
+
+    registry = _RequestSocketRegistry() if abort_event is not None else None
+    watcher_done = threading.Event()
+    watcher: threading.Thread | None = None
+    open_request: Callable[..., Any] = urllib.request.urlopen
+    if abort_event is not None and registry is not None:
+        watcher = threading.Thread(
+            target=_close_request_sockets_on_abort,
+            args=(abort_event, registry, watcher_done),
+            name="ccswitch-request-cancel-watcher",
+            daemon=True,
+        )
+        watcher.start()
+        # Build a fresh opener for every cancellable request so a proxy switch
+        # is picked up without relying on urllib's process-global opener cache.
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler(urllib.request.getproxies()),
+            _AbortableHTTPHandler(abort_event, registry),
+            _AbortableHTTPSHandler(abort_event, registry),
+        )
+        open_request = opener.open
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_request(request, timeout=timeout) as response:
+            response_transport = _http_response_transport(response)
+            if registry is not None:
+                registry.add(response_transport)
             response_headers = {
                 str(key): _redact_secret_text(str(value), provider.api_key)
                 for key, value in response.headers.items()
             }
             try:
-                raw = _redact_secret_text(_decode_http_body(response.read(), response.headers), provider.api_key)
-            except (OSError, EOFError, zlib.error) as exc:
-                error = _redact_secret_text(f"响应解压或解码失败：{exc}", provider.api_key)
-                return response.status, None, response_headers, error
+                try:
+                    raw = _redact_secret_text(_decode_http_body(response.read(), response.headers), provider.api_key)
+                except (OSError, EOFError, ValueError, zlib.error) as exc:
+                    if abort_event is not None and abort_event.is_set():
+                        return None, None, {}, "请求已取消。"
+                    error = _redact_secret_text(f"响应解压或解码失败：{exc}", provider.api_key)
+                    return response.status, None, response_headers, error
+            finally:
+                if registry is not None:
+                    registry.remove(response_transport)
+            if abort_event is not None and abort_event.is_set():
+                return None, None, {}, "请求已取消。"
             return response.status, _json_or_text(raw), response_headers, ""
     except urllib.error.HTTPError as exc:
+        response_transport = _http_response_transport(exc)
+        if registry is not None:
+            registry.add(response_transport)
         response_headers = (
             {
                 str(key): _redact_secret_text(str(value), provider.api_key)
@@ -2016,13 +2226,30 @@ def _http_request(
             else {}
         )
         try:
-            raw = _redact_secret_text(_decode_http_body(exc.read(), exc.headers)[:2000], provider.api_key)
-        except (OSError, EOFError, zlib.error) as decode_exc:
-            error = _redact_secret_text(f"响应解压或解码失败：{decode_exc}", provider.api_key)
-            return exc.code, None, response_headers, error
+            try:
+                raw = _redact_secret_text(_decode_http_body(exc.read(), exc.headers)[:2000], provider.api_key)
+            except (OSError, EOFError, ValueError, zlib.error) as decode_exc:
+                if abort_event is not None and abort_event.is_set():
+                    return None, None, {}, "请求已取消。"
+                error = _redact_secret_text(f"响应解压或解码失败：{decode_exc}", provider.api_key)
+                return exc.code, None, response_headers, error
+        finally:
+            if registry is not None:
+                registry.remove(response_transport)
+        if abort_event is not None and abort_event.is_set():
+            return None, None, {}, "请求已取消。"
         return exc.code, _json_or_text(raw), response_headers, raw
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        if abort_event is not None and abort_event.is_set():
+            return None, None, {}, "请求已取消。"
         return None, None, {}, _redact_secret_text(str(exc), provider.api_key)
+    finally:
+        if watcher_done is not None:
+            watcher_done.set()
+        if registry is not None:
+            registry.close_all()
+        if watcher is not None:
+            watcher.join(timeout=0.2)
 
 
 def _request_timeout(config: dict[str, Any], deadline: float) -> float:
@@ -2058,7 +2285,15 @@ def _poll_pending(
         timeout = _request_timeout(config, deadline)
         if timeout <= 0:
             break
-        status, body, headers, error = _http_request("GET", poll_url, None, provider, config, timeout)
+        status, body, headers, error = _http_request(
+            "GET",
+            poll_url,
+            None,
+            provider,
+            config,
+            timeout,
+            abort_event,
+        )
         if status is None:
             logger.log(f"POLL_WAIT round={result.round_no} request={result.index} error={error[:300]}")
             continue
@@ -2133,17 +2368,47 @@ def send_one(
     candidates = endpoint_candidates(provider, str(config["endpoint_style"]))
     attempted_endpoints = 0
     for endpoint in candidates:
+        if abort_polling is not None and abort_polling.is_set():
+            return AttemptResult(
+                index=index,
+                round_no=round_no,
+                ok=False,
+                error="请求已取消。",
+                provider_name=provider.name,
+                request_prompt=request_prompt,
+                cancelled=True,
+            )
         timeout = _request_timeout(config, deadline)
         if timeout <= 0:
             last_error = "请求未发送：已到达本轮截止时间。"
             break
         attempted_endpoints += 1
         last_endpoint = endpoint
-        status, payload, headers, error = _http_request("POST", endpoint, body, provider, config, timeout)
+        status, payload, headers, error = _http_request(
+            "POST",
+            endpoint,
+            body,
+            provider,
+            config,
+            timeout,
+            abort_polling,
+        )
         last_status = status
         last_payload = payload
         last_headers = headers
         latency_ms = int((time.monotonic() - started) * 1000)
+        if abort_polling is not None and abort_polling.is_set() and status is None:
+            return AttemptResult(
+                index=index,
+                round_no=round_no,
+                ok=False,
+                error="请求已取消。",
+                endpoint=endpoint,
+                latency_ms=latency_ms,
+                provider_name=provider.name,
+                request_prompt=request_prompt,
+                cancelled=True,
+            )
         html_error = _html_response_error(payload, headers)
         if html_error:
             saw_html_response = True
@@ -2248,7 +2513,9 @@ def build_result_dict(
     now: dt.datetime | None = None,
 ) -> dict[str, Any]:
     data: dict[str, Any] = {
-        "completed_at": (now or dt.datetime.now().astimezone()).isoformat(timespec="seconds"),
+        "completed_at": result.completed_at
+        or (now or dt.datetime.now().astimezone()).isoformat(timespec="seconds"),
+        "ok": result.ok,
         "round": result.round_no,
         "request_index": result.index,
         "transport": config.get("transport_mode", TRANSPORT_DIRECT),
@@ -2257,6 +2524,7 @@ def build_result_dict(
         "latency_ms": result.latency_ms,
         "endpoint": _redact_url(result.endpoint),
         "text": result.text,
+        "error": result.error,
         "message": result.request_prompt
         or ("" if bool(config.get("custom_body_enabled")) else str(config["message"])),
     }
@@ -2293,6 +2561,174 @@ def _all_failures_are_non_retryable(results: list[AttemptResult]) -> bool:
         or (item.retryable is None and item.status in {400, 401, 403, 404, 405, 422})
         for item in results
     )
+
+
+def send_keepalive_once(
+    provider: Provider,
+    config: dict[str, Any],
+    logger: RunLogger,
+    stop_event: threading.Event | None = None,
+    *,
+    sequence: int = 1,
+    sender: Callable[..., AttemptResult] | None = None,
+) -> AttemptResult:
+    """Send one post-success keepalive request using the pinned run configuration."""
+    config = normalize_config(config)
+    transport_mode = str(config["transport_mode"])
+    if sender is None:
+        sender = send_one_codex_cli if transport_mode == TRANSPORT_CODEX_CLI else send_one
+    if transport_mode == TRANSPORT_CODEX_CLI:
+        config["_cli_semaphore"] = threading.Semaphore(1)
+
+    abort_event = stop_event or threading.Event()
+    request_timeout = float(config["request_timeout_seconds"])
+    deadline = time.monotonic() + request_timeout
+    if abort_event.is_set():
+        result = AttemptResult(
+            index=1,
+            round_no=sequence,
+            ok=False,
+            error="保持请求已取消。",
+            provider_name=provider.name,
+            cancelled=True,
+        )
+    else:
+        try:
+            result = sender(
+                1,
+                provider,
+                config,
+                deadline,
+                logger,
+                abort_event,
+                round_no=sequence,
+            )
+            if time.monotonic() > deadline and not result.cancelled:
+                result = AttemptResult(
+                    index=1,
+                    round_no=sequence,
+                    ok=False,
+                    error="单请求超时。",
+                    provider_name=provider.name,
+                    request_prompt=result.request_prompt,
+                )
+        except Exception as exc:
+            result = AttemptResult(
+                index=1,
+                round_no=sequence,
+                ok=False,
+                error=_redact_secret_text(f"{type(exc).__name__}: {exc}", provider.api_key),
+                provider_name=provider.name,
+            )
+
+    result = _sanitize_attempt_result(result, provider.api_key)
+    if not result.completed_at:
+        result.completed_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    if result.ok:
+        logger.log(
+            "KEEPALIVE_OK sequence=%s status=%s latency_ms=%s success_at=%s response=%s"
+            % (
+                sequence,
+                result.status or "",
+                result.latency_ms,
+                result.completed_at,
+                _response_log_summary(result),
+            )
+        )
+    elif result.cancelled:
+        logger.log("KEEPALIVE_CANCELLED sequence=%s reason=%s" % (sequence, result.error[:500]))
+    else:
+        logger.log(
+            "KEEPALIVE_FAIL sequence=%s status=%s error=%s response=%s"
+            % (
+                sequence,
+                result.status or "",
+                result.error[:500],
+                _response_log_summary(result),
+            )
+        )
+    return result
+
+
+def run_success_keepalive(
+    provider: Provider,
+    config: dict[str, Any],
+    logger: RunLogger,
+    stop_event: threading.Event,
+    *,
+    on_progress: Callable[[ProgressEvent], None] | None = None,
+    sender: Callable[..., AttemptResult] | None = None,
+    waiter: Callable[[float], bool] | None = None,
+) -> KeepaliveOutcome:
+    """Keep one post-success request running at the configured interval until stopped."""
+    config = normalize_config(config)
+    interval = float(config["success_keepalive_interval_seconds"])
+    wait = waiter or stop_event.wait
+    sent = succeeded = failed = 0
+    logger.log(f"KEEPALIVE_ARMED interval_seconds={interval:g}")
+
+    while not stop_event.is_set():
+        next_run_at = time.time() + interval
+        _emit_progress(
+            on_progress,
+            kind="keepalive_wait",
+            keepalive_sequence=sent,
+            keepalive_successes=succeeded,
+            keepalive_failures=failed,
+            next_run_at=next_run_at,
+            message=f"{interval:g} 秒后发送下一次定时请求。",
+        )
+        if wait(interval):
+            break
+
+        sequence = sent + 1
+        _emit_progress(
+            on_progress,
+            kind="keepalive_start",
+            keepalive_sequence=sequence,
+            keepalive_successes=succeeded,
+            keepalive_failures=failed,
+            message="正在发送定时请求。",
+        )
+        result = send_keepalive_once(
+            provider,
+            config,
+            logger,
+            stop_event,
+            sequence=sequence,
+            sender=sender,
+        )
+        if result.cancelled and stop_event.is_set():
+            break
+        sent += 1
+        if result.ok:
+            succeeded += 1
+        else:
+            failed += 1
+        _emit_progress(
+            on_progress,
+            kind="keepalive_result",
+            keepalive_sequence=sent,
+            keepalive_successes=succeeded,
+            keepalive_failures=failed,
+            message=(result.text if result.ok else result.error),
+            winner=result if result.ok else None,
+            result=result,
+        )
+
+    logger.log(
+        "KEEPALIVE_STOPPED sent=%s succeeded=%s failed=%s"
+        % (sent, succeeded, failed)
+    )
+    _emit_progress(
+        on_progress,
+        kind="keepalive_stopped",
+        keepalive_sequence=sent,
+        keepalive_successes=succeeded,
+        keepalive_failures=failed,
+        message="定时保持已停止。",
+    )
+    return KeepaliveOutcome(sent=sent, succeeded=succeeded, failed=failed, stopped=True)
 
 
 def run_batch(
@@ -2334,6 +2770,25 @@ def run_batch(
     completed_total = 0
     failed_total = 0
     winner: AttemptResult | None = None
+    winner_at = ""
+    success_cancel_deadline: float | None = None
+    success_cancel_expired = False
+    # Keep cancellation events only while their batch still has live workers.
+    # This lets a later success cancel stale workers without growing a list
+    # forever during unlimited retries.
+    active_abort_batches: list[tuple[threading.Event, list[threading.Thread]]] = []
+
+    def prune_finished_abort_batches() -> None:
+        active_abort_batches[:] = [
+            (event, threads)
+            for event, threads in active_abort_batches
+            if any(thread.is_alive() for thread in threads)
+        ]
+
+    def abort_all_active_requests() -> None:
+        prune_finished_abort_batches()
+        for event, _threads in active_abort_batches:
+            event.set()
     codex_version = detect_codex_cli_version()
     if bool(config.get("custom_body_enabled")):
         task_mode = "custom-random" if request_uses_random_probe(config) else "custom"
@@ -2449,6 +2904,7 @@ def run_batch(
         threads: list[threading.Thread] = []
         request_deadlines: list[float] = []
         abort_polling = threading.Event()
+        active_abort_batches.append((abort_polling, threads))
 
         def worker(number: int, request_deadline: float) -> None:
             acquired = False
@@ -2475,7 +2931,7 @@ def run_batch(
                     abort_polling,
                     round_no=round_no,
                 )
-                if time.monotonic() > request_deadline:
+                if time.monotonic() > request_deadline and not item.cancelled:
                     item = AttemptResult(
                         index=number,
                         round_no=round_no,
@@ -2539,7 +2995,7 @@ def run_batch(
             if stop_event.is_set() and not stop_noted:
                 stop_noted = True
                 stop_guard_deadline = time.monotonic() + REQUEST_COMPLETION_GRACE_SECONDS
-                abort_polling.set()
+                abort_all_active_requests()
                 logger.log("STOPPING no new batch will be started; waiting for dispatched requests")
                 _emit_progress(
                     on_progress,
@@ -2559,37 +3015,67 @@ def run_batch(
                 collector_deadline = min(collector_deadline, run_deadline)
             if stop_guard_deadline is not None:
                 collector_deadline = min(collector_deadline, stop_guard_deadline)
+            if success_cancel_deadline is not None:
+                collector_deadline = min(collector_deadline, success_cancel_deadline)
             remaining = collector_deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
+                success_cancel_expired = (
+                    winner is not None
+                    and success_cancel_deadline is not None
+                    and time.monotonic() >= success_cancel_deadline
+                    and not stop_event.is_set()
+                    and not (
+                        run_deadline is not None
+                        and run_deadline <= success_cancel_deadline
+                    )
+                )
                 total_wait_expired = (
                     run_deadline is not None
                     and run_deadline <= request_guard_deadline
                     and (stop_guard_deadline is None or run_deadline <= stop_guard_deadline)
                 )
-                abort_polling.set()
+                abort_all_active_requests()
                 break
             try:
                 item = result_queue.get(timeout=min(0.25, remaining))
             except queue.Empty:
                 continue
             round_results.append(item)
+            if not item.completed_at:
+                item.completed_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
             completed_indices.add(item.index)
             completed_in_round += 1
             completed_total += 1
             if item.ok:
+                logger.log(
+                    "SUCCESS_RESULT batch=%s request=%s status=%s latency_ms=%s success_at=%s response=%s"
+                    % (
+                        item.round_no,
+                        item.index,
+                        item.status or "",
+                        item.latency_ms,
+                        item.completed_at,
+                        _response_log_summary(item),
+                    )
+                )
                 if winner is None:
                     winner = item
-                    abort_polling.set()
+                    winner_at = item.completed_at
+                    abort_all_active_requests()
+                    success_cancel_deadline = (
+                        time.monotonic() + SUCCESS_CANCELLATION_GRACE_SECONDS
+                    )
                     if transport_mode == TRANSPORT_CODEX_CLI:
                         terminate_active_codex_processes()
                     logger.log(
-                        "FIRST_RESULT batch=%s request=%s status=%s latency_ms=%s prompt=%s text=%s response=%s"
+                        "FIRST_RESULT batch=%s request=%s status=%s latency_ms=%s success_at=%s prompt=%s text=%s response=%s"
                         % (
                             item.round_no,
                             item.index,
                             item.status,
                             item.latency_ms,
+                            winner_at,
                             (
                                 item.request_prompt.replace("\r", " ").replace("\n", " ")[:500]
                                 if request_uses_random_probe(config)
@@ -2642,6 +3128,7 @@ def run_batch(
                     break
                 thread.join(timeout=remaining)
             run_threads[:] = [thread for thread in run_threads if thread.is_alive()]
+            prune_finished_abort_batches()
             stopped = stop_event.is_set()
             if stopped or total_wait_expired:
                 unfinished = sum(thread.is_alive() for thread in run_threads)
@@ -2672,21 +3159,33 @@ def run_batch(
             for number in range(1, request_count + 1):
                 if number in completed_indices:
                     continue
+                cancelled_after_success = success_cancel_expired and winner is not None
                 item = AttemptResult(
                     index=number,
                     round_no=round_no,
                     ok=False,
-                    error="单请求超时：请求线程在截止时间后仍未结束。",
+                    error=(
+                        "成功后已请求取消；底层请求线程仍在回收。"
+                        if cancelled_after_success
+                        else "单请求超时：请求线程在截止时间后仍未结束。"
+                    ),
                     provider_name=provider.name,
+                    cancelled=cancelled_after_success,
                 )
                 round_results.append(item)
                 completed_in_round += 1
                 completed_total += 1
-                failed_total += 1
-                logger.log(
-                    "REQUEST_TIMEOUT batch=%s request=%s reason=worker_unfinished"
-                    % (round_no, number)
-                )
+                if cancelled_after_success:
+                    logger.log(
+                        "REQUEST_CANCELLED batch=%s request=%s reason=success_received"
+                        % (round_no, number)
+                    )
+                else:
+                    failed_total += 1
+                    logger.log(
+                        "REQUEST_TIMEOUT batch=%s request=%s reason=worker_unfinished"
+                        % (round_no, number)
+                    )
                 _emit_progress(
                     on_progress,
                     kind="request_complete",
@@ -2710,9 +3209,17 @@ def run_batch(
                 break
             thread.join(timeout=remaining)
         run_threads[:] = [thread for thread in run_threads if thread.is_alive()]
+        prune_finished_abort_batches()
         logger.log(
-            "BATCH_COMPLETE batch=%s completed=%s requested=%s success=%s"
-            % (round_no, completed_in_round, request_count, bool(winner))
+            "BATCH_COMPLETE batch=%s completed=%s requested=%s success=%s success_at=%s unfinished=%s"
+            % (
+                round_no,
+                completed_in_round,
+                request_count,
+                bool(winner),
+                winner_at if winner is not None else "",
+                len(run_threads),
+            )
         )
         if winner is not None:
             _emit_progress(
@@ -2730,8 +3237,8 @@ def run_batch(
                 message="本批已结束。",
             )
             logger.log(
-                "RUN_END code=0 launched=%s completed=%s failed=%s"
-                % (launched_total, completed_total, failed_total)
+                "RUN_END code=0 launched=%s completed=%s failed=%s success_at=%s unfinished=%s"
+                % (launched_total, completed_total, failed_total, winner_at, len(run_threads))
             )
             unfinished = sum(thread.is_alive() for thread in run_threads)
             return RunOutcome(0, winner, launched_total, completed_total, failed_total, unfinished)
@@ -2766,6 +3273,7 @@ def run_batch(
                     logger.log("STOPPED while waiting for a sender slot")
                     return RunOutcome(130, None, launched_total, completed_total, failed_total, len(run_threads))
                 run_threads[:] = [thread for thread in run_threads if thread.is_alive()]
+                prune_finished_abort_batches()
         if _all_failures_are_non_retryable(round_results):
             logger.log("HARD_FAIL all responses indicate a non-retryable request/configuration error")
             no_result_message = "请求或配置错误不可重试。"

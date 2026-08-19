@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import gzip
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 import random
 import sqlite3
@@ -175,6 +176,16 @@ class ConfigTests(unittest.TestCase):
         config = sender.normalize_config({"request_count": 7, "retry_count": 2})
         self.assertEqual(config["request_count"] * (1 + config["retry_count"]), 21)
 
+    def test_success_keepalive_defaults_to_three_minutes(self) -> None:
+        config = sender.normalize_config()
+
+        self.assertTrue(config["success_keepalive_enabled"])
+        self.assertEqual(config["success_keepalive_interval_seconds"], 180)
+
+    def test_success_keepalive_interval_must_be_at_least_one_minute(self) -> None:
+        with self.assertRaises(sender.SenderError):
+            sender.normalize_config({"success_keepalive_interval_seconds": 59})
+
     def test_retry_count_accepts_finite_values_above_ten(self) -> None:
         self.assertEqual(sender.normalize_config({"retry_count": 25})["retry_count"], 25)
         self.assertEqual(
@@ -312,6 +323,30 @@ class ConfigTests(unittest.TestCase):
             loaded = sender.load_saved_config(path=path)
 
             self.assertEqual(loaded["request_timeout_seconds"], 37)
+
+    def test_saved_config_round_trips_success_keepalive_settings(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ccswitch-config-test-") as temp:
+            path = Path(temp) / "settings.json"
+            sender.save_saved_config(
+                sender.normalize_config(
+                    {
+                        "success_keepalive_enabled": False,
+                        "success_keepalive_interval_seconds": 420,
+                    }
+                ),
+                path=path,
+            )
+
+            loaded = sender.load_saved_config(path=path)
+
+            self.assertFalse(loaded["success_keepalive_enabled"])
+            self.assertEqual(loaded["success_keepalive_interval_seconds"], 420)
+
+    def test_v8_config_enables_default_success_keepalive(self) -> None:
+        migrated = sender.migrate_saved_config({}, 8)
+
+        self.assertTrue(migrated["success_keepalive_enabled"])
+        self.assertEqual(migrated["success_keepalive_interval_seconds"], 180)
 
     def test_legacy_registry_config_is_saved_before_cleanup(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ccswitch-config-migration-") as temp:
@@ -1024,6 +1059,99 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(headers["Content-Encoding"], "gzip")
         self.assertIn("响应解压或解码失败", error)
 
+    def test_http_request_abort_closes_a_blocked_response_read(self) -> None:
+        request_started = threading.Event()
+        release_response = threading.Event()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length:
+                    self.rfile.read(length)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "1024")
+                self.end_headers()
+                self.wfile.write(b"{")
+                self.wfile.flush()
+                request_started.set()
+                release_response.wait(5)
+
+            def log_message(self, _format: str, *args: Any) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        abort_event = threading.Event()
+        result: list[tuple[int | None, Any, dict[str, str], str]] = []
+        caller = threading.Thread(
+            target=lambda: result.append(
+                sender._http_request(
+                    "POST",
+                    f"http://127.0.0.1:{server.server_port}/responses",
+                    {"input": "local cancellation test"},
+                    self.provider,
+                    sender.normalize_config(),
+                    5,
+                    abort_event,
+                )
+            ),
+            daemon=True,
+        )
+        server_thread.start()
+        caller.start()
+        try:
+            self.assertTrue(request_started.wait(2))
+            cancelled_at = time.monotonic()
+            abort_event.set()
+            caller.join(1)
+            self.assertFalse(caller.is_alive())
+            self.assertLess(time.monotonic() - cancelled_at, 1)
+            self.assertEqual(result[0][0], None)
+            self.assertEqual(result[0][3], "请求已取消。")
+        finally:
+            release_response.set()
+            server.shutdown()
+            server.server_close()
+            server_thread.join(2)
+            caller.join(2)
+
+    def test_http_request_discards_a_response_completed_after_abort(self) -> None:
+        abort_event = threading.Event()
+
+        class Response:
+            status = 200
+            headers: dict[str, str] = {}
+            fp = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self) -> bytes:
+                abort_event.set()
+                return b'{"output_text":"late success"}'
+
+        opener = mock.Mock()
+        opener.open.return_value = Response()
+        with mock.patch.object(sender.urllib.request, "build_opener", return_value=opener):
+            status, payload, headers, error = sender._http_request(
+                "POST",
+                "https://api.example.test/responses",
+                {"input": "probe"},
+                self.provider,
+                sender.normalize_config(),
+                5,
+                abort_event,
+            )
+
+        self.assertIsNone(status)
+        self.assertIsNone(payload)
+        self.assertEqual(headers, {})
+        self.assertEqual(error, "请求已取消。")
+
     def test_request_headers_use_captured_codex_exec_compatibility_identity(self) -> None:
         headers = sender.build_request_headers(
             self.provider,
@@ -1315,8 +1443,40 @@ class ProtocolTests(unittest.TestCase):
             text="done",
         )
         data = sender.build_result_dict(result, sender.normalize_config())
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["error"], "")
         self.assertEqual(data["endpoint"], "https://api.example.test/v1/responses")
         self.assertNotIn("secret", json.dumps(data))
+
+    def test_failed_result_export_includes_error(self) -> None:
+        result = sender.AttemptResult(
+            index=1,
+            round_no=3,
+            ok=False,
+            status=502,
+            error="upstream unavailable",
+            endpoint="https://api.example.test/v1/responses",
+            provider_name="Provider A",
+        )
+
+        data = sender.build_result_dict(result, sender.normalize_config())
+
+        self.assertFalse(data["ok"])
+        self.assertEqual(data["error"], "upstream unavailable")
+
+    def test_result_export_preserves_recorded_completion_time(self) -> None:
+        result = sender.AttemptResult(
+            index=1,
+            round_no=2,
+            ok=True,
+            status=200,
+            text="done",
+            completed_at="2026-08-20T09:30:00+08:00",
+        )
+
+        data = sender.build_result_dict(result, sender.normalize_config())
+
+        self.assertEqual(data["completed_at"], "2026-08-20T09:30:00+08:00")
 
 
 class GuiGuardTests(unittest.TestCase):
@@ -1363,6 +1523,67 @@ class GuiGuardTests(unittest.TestCase):
 
         app._selected_provider_id.assert_not_called()
 
+    def test_success_keepalive_gate_requires_a_fully_reclaimed_success(self) -> None:
+        winner = sender.AttemptResult(index=1, ok=True, status=200, text="ok")
+        success = sender.RunOutcome(0, winner, 1, 1, 0, 0)
+        success_with_unfinished = sender.RunOutcome(0, winner, 2, 2, 0, 1)
+        enabled = sender.normalize_config({"success_keepalive_enabled": True})
+        disabled = sender.normalize_config({"success_keepalive_enabled": False})
+
+        self.assertTrue(sender_ui._should_start_success_keepalive(success, enabled, stopped=False))
+        self.assertFalse(
+            sender_ui._should_start_success_keepalive(
+                success_with_unfinished,
+                enabled,
+                stopped=False,
+            )
+        )
+        self.assertFalse(sender_ui._should_start_success_keepalive(success, disabled, stopped=False))
+        self.assertFalse(sender_ui._should_start_success_keepalive(success, enabled, stopped=True))
+
+    def test_success_notification_is_still_allowed_when_keepalive_cannot_start(self) -> None:
+        winner = sender.AttemptResult(index=1, ok=True, status=200, text="ok")
+        enabled = sender.normalize_config({"success_keepalive_enabled": True})
+
+        self.assertTrue(
+            sender_ui._should_notify_success_without_keepalive(
+                sender.RunOutcome(0, winner, 2, 2, 0, 1),
+                enabled,
+                stopped=False,
+            )
+        )
+        self.assertTrue(
+            sender_ui._should_notify_success_without_keepalive(
+                sender.RunOutcome(0, winner, 1, 1, 0, 0),
+                enabled,
+                stopped=True,
+            )
+        )
+        self.assertFalse(
+            sender_ui._should_notify_success_without_keepalive(
+                sender.RunOutcome(0, winner, 1, 1, 0, 0),
+                enabled,
+                stopped=False,
+            )
+        )
+
+    def test_windows_notification_uses_hidden_powershell_and_environment_text(self) -> None:
+        completed = mock.Mock(returncode=0)
+        with (
+            mock.patch.object(sender_ui.os, "name", "nt"),
+            mock.patch.object(sender_ui.Path, "exists", return_value=True),
+            mock.patch.object(sender_ui.subprocess, "run", return_value=completed) as run,
+        ):
+            shown = sender_ui.show_windows_notification("成功", "已进入定时保持")
+
+        self.assertTrue(shown)
+        command = run.call_args.args[0]
+        environment = run.call_args.kwargs["env"]
+        self.assertIn("-WindowStyle", command)
+        self.assertIn("Hidden", command)
+        self.assertEqual(environment["CCSWITCH_NOTIFICATION_TITLE"], "成功")
+        self.assertEqual(environment["CCSWITCH_NOTIFICATION_BODY"], "已进入定时保持")
+
 
 class RunnerTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1397,6 +1618,227 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(outcome.completed, 4)
         self.assertEqual(outcome.winner.round_no, 2)
         self.assertEqual(len(calls), 4)
+
+    def test_first_success_does_not_wait_for_a_stuck_sibling(self) -> None:
+        release_sender = threading.Event()
+        stuck_started = threading.Event()
+        logs: list[str] = []
+
+        def fake_sender(index, provider, config, deadline, logger, abort_polling, *, round_no=1):
+            if index == 1:
+                return sender.AttemptResult(
+                    index=index,
+                    round_no=round_no,
+                    ok=True,
+                    status=200,
+                    text="ok",
+                    provider_name=provider.name,
+                )
+            stuck_started.set()
+            release_sender.wait()
+            return sender.AttemptResult(
+                index=index,
+                round_no=round_no,
+                ok=False,
+                error="late",
+                provider_name=provider.name,
+            )
+
+        started = time.monotonic()
+        try:
+            with mock.patch.object(sender, "SUCCESS_CANCELLATION_GRACE_SECONDS", 0.02), mock.patch.object(
+                sender, "REQUEST_COMPLETION_GRACE_SECONDS", 0.02
+            ):
+                outcome = sender.run_batch(
+                    sender.normalize_config(
+                        {
+                            "request_count": 2,
+                            "retry_count": 1,
+                            "request_timeout_seconds": 60,
+                            "max_wait_seconds": 0,
+                            "retry_interval_seconds": 0,
+                        }
+                    ),
+                    sender.RunLogger(callback=logs.append),
+                    provider_loader=lambda _config: self.provider,
+                    sender=fake_sender,
+                )
+        finally:
+            release_sender.set()
+
+        self.assertTrue(stuck_started.is_set())
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(outcome.code, 0)
+        self.assertIsNotNone(outcome.winner)
+        self.assertEqual(outcome.failed, 0)
+        self.assertGreaterEqual(outcome.unfinished, 1)
+        first_result = next(line for line in logs if "FIRST_RESULT" in line)
+        success_result = next(line for line in logs if "SUCCESS_RESULT" in line)
+        batch_complete = next(line for line in logs if "BATCH_COMPLETE" in line)
+        self.assertIn("success_at=", first_result)
+        self.assertIn("success_at=", success_result)
+        self.assertIn("success_at=", batch_complete)
+        self.assertTrue(any("reason=success_received" in line for line in logs))
+
+    def test_cancelled_result_is_not_reclassified_as_timeout_after_deadline(self) -> None:
+        logs: list[str] = []
+
+        def fake_sender(index, provider, config, deadline, logger, abort_polling, *, round_no=1):
+            time.sleep(0.03)
+            return sender.AttemptResult(
+                index=index,
+                round_no=round_no,
+                ok=False,
+                error="请求已取消。",
+                provider_name=provider.name,
+                cancelled=True,
+            )
+
+        outcome = sender.run_batch(
+            sender.normalize_config(
+                {
+                    "request_count": 1,
+                    "retry_count": 1,
+                    "request_timeout_seconds": 0.01,
+                    "retry_interval_seconds": 0,
+                }
+            ),
+            sender.RunLogger(callback=logs.append),
+            provider_loader=lambda _config: self.provider,
+            sender=fake_sender,
+        )
+
+        self.assertEqual(outcome.code, 1)
+        self.assertEqual(outcome.failed, 0)
+        self.assertEqual(sum("REQUEST_CANCELLED" in line for line in logs), 2)
+        self.assertFalse(any("REQUEST_TIMEOUT" in line for line in logs))
+
+    def test_direct_api_success_aborts_a_sibling_blocked_in_response_read(self) -> None:
+        request_number = 0
+        request_lock = threading.Lock()
+        blocked_started = threading.Event()
+        release_blocked = threading.Event()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                nonlocal request_number
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length:
+                    self.rfile.read(length)
+                with request_lock:
+                    request_number += 1
+                    current = request_number
+                if current == 1:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", "1024")
+                    self.end_headers()
+                    self.wfile.write(b"{")
+                    self.wfile.flush()
+                    blocked_started.set()
+                    release_blocked.wait(5)
+                    return
+                body = json.dumps({"output_text": "ok"}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *args: Any) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        provider = sender.Provider(
+            provider_id="local-provider",
+            name="Local Provider",
+            api_key="local-key",
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            model="gpt-test",
+            api_format="openai_responses",
+        )
+        logs: list[str] = []
+        try:
+            outcome = sender.run_batch(
+                sender.normalize_config(
+                    {
+                        "request_count": 2,
+                        "retry_count": 1,
+                        "request_timeout_seconds": 5,
+                        "retry_interval_seconds": 0,
+                        "random_probe_enabled": False,
+                        "message": "local cancellation test",
+                        "endpoint_style": "openai",
+                    }
+                ),
+                sender.RunLogger(callback=logs.append),
+                provider_loader=lambda _config: provider,
+            )
+        finally:
+            release_blocked.set()
+            server.shutdown()
+            server.server_close()
+            server_thread.join(2)
+
+        self.assertTrue(blocked_started.is_set())
+        self.assertEqual(outcome.code, 0)
+        self.assertEqual(outcome.unfinished, 0)
+        self.assertEqual(outcome.failed, 0)
+        self.assertTrue(any("REQUEST_CANCELLED" in line for line in logs))
+
+    def test_success_keepalive_sends_one_request_per_interval_and_continues_after_failure(self) -> None:
+        calls: list[int] = []
+        waits: list[float] = []
+        logs: list[str] = []
+        progress: list[sender.ProgressEvent] = []
+        wait_results = iter((False, False, True))
+
+        def fake_wait(seconds: float) -> bool:
+            waits.append(seconds)
+            return next(wait_results)
+
+        def fake_sender(index, provider, config, deadline, logger, abort_polling, *, round_no=1):
+            calls.append(round_no)
+            if round_no == 1:
+                return sender.AttemptResult(
+                    index=index,
+                    round_no=round_no,
+                    ok=False,
+                    status=502,
+                    error="temporary",
+                    provider_name=provider.name,
+                )
+            return sender.AttemptResult(
+                index=index,
+                round_no=round_no,
+                ok=True,
+                status=200,
+                text="kept",
+                provider_name=provider.name,
+            )
+
+        outcome = sender.run_success_keepalive(
+            self.provider,
+            sender.normalize_config({"success_keepalive_interval_seconds": 180}),
+            sender.RunLogger(callback=logs.append),
+            threading.Event(),
+            on_progress=progress.append,
+            sender=fake_sender,
+            waiter=fake_wait,
+        )
+
+        self.assertEqual(calls, [1, 2])
+        self.assertEqual(waits, [180, 180, 180])
+        self.assertEqual(outcome, sender.KeepaliveOutcome(sent=2, succeeded=1, failed=1, stopped=True))
+        self.assertEqual(sum("KEEPALIVE_OK" in line for line in logs), 1)
+        self.assertEqual(sum("KEEPALIVE_FAIL" in line for line in logs), 1)
+        self.assertEqual([event.kind for event in progress].count("keepalive_start"), 2)
+        self.assertEqual([event.kind for event in progress].count("keepalive_result"), 2)
+        keepalive_results = [event.result for event in progress if event.kind == "keepalive_result"]
+        self.assertEqual([item.ok for item in keepalive_results if item is not None], [False, True])
+        self.assertEqual(progress[-1].kind, "keepalive_stopped")
 
     def test_provider_snapshot_is_reused_across_retry_batches(self) -> None:
         provider_loads: list[str] = []

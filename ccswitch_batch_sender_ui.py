@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -46,6 +47,7 @@ from ccswitch_batch_sender import (
     resolve_codex_cli_executable,
     resource_path,
     run_batch,
+    run_success_keepalive,
     save_result,
     save_saved_config,
     terminate_active_codex_processes,
@@ -84,12 +86,86 @@ ENDPOINT_LABELS = {
 ENDPOINT_VALUES = {value: label for label, value in ENDPOINT_LABELS.items()}
 
 
+_WINDOWS_TOAST_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null
+$template = [Windows.UI.Notifications.ToastTemplateType]::ToastText02
+$xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent($template)
+$nodes = $xml.GetElementsByTagName('text')
+$nodes.Item(0).AppendChild($xml.CreateTextNode($env:CCSWITCH_NOTIFICATION_TITLE)) | Out-Null
+$nodes.Item(1).AppendChild($xml.CreateTextNode($env:CCSWITCH_NOTIFICATION_BODY)) | Out-Null
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('CC Switch Batch Sender').Show($toast)
+"""
+
+
+def show_windows_notification(title: str, body: str) -> bool:
+    if os.name != "nt":
+        return False
+    powershell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    if not powershell.exists():
+        return False
+    env = os.environ.copy()
+    env["CCSWITCH_NOTIFICATION_TITLE"] = str(title)[:64]
+    env["CCSWITCH_NOTIFICATION_BODY"] = str(body)[:240]
+    try:
+        completed = subprocess.run(
+            [
+                str(powershell),
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                _WINDOWS_TOAST_SCRIPT,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+            check=False,
+            env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return completed.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _default_provider_id(catalog: ProviderCatalog) -> str:
     """Prefer the first provider whose name contains ``any``; otherwise use current."""
     for summary in catalog.providers:
         if "any" in summary.name.casefold():
             return summary.provider_id
     return catalog.current_provider_id
+
+
+def _should_start_success_keepalive(
+    outcome: RunOutcome,
+    config: dict[str, Any],
+    *,
+    stopped: bool,
+) -> bool:
+    return (
+        outcome.winner is not None
+        and outcome.unfinished == 0
+        and bool(config.get("success_keepalive_enabled"))
+        and not stopped
+    )
+
+
+def _should_notify_success_without_keepalive(
+    outcome: RunOutcome,
+    config: dict[str, Any],
+    *,
+    stopped: bool,
+) -> bool:
+    """Notify about a success when enabled keepalive cannot actually start."""
+    return (
+        outcome.winner is not None
+        and bool(config.get("success_keepalive_enabled"))
+        and not _should_start_success_keepalive(outcome, config, stopped=stopped)
+    )
 
 
 class Tooltip:
@@ -188,8 +264,20 @@ class BatchSenderApp:
         self.notice_after_id: str | None = None
         self.elapsed_after_id: str | None = None
         self.run_started_at = 0.0
+        self.keepalive_next_run_at = 0.0
+        self.keepalive_started = False
+        self.keepalive_active = False
+        self.keepalive_request_active = False
+        self.success_notification_sent = False
+        self.closing = False
+        self.run_generation = 0
+        self.ui_event_queue: queue.SimpleQueue[
+            tuple[int | None, Callable[[], None]]
+        ] = queue.SimpleQueue()
+        self.ui_event_after_id: str | None = None
         self.latest_result: AttemptResult | None = None
         self.last_run_config: dict[str, Any] | None = None
+        self.active_logger: RunLogger | None = None
         self.log_lines: list[str] = []
         self.catalog: ProviderCatalog | None = None
         self.provider_by_id: dict[str, ProviderSummary] = {}
@@ -206,6 +294,7 @@ class BatchSenderApp:
         self._load_initial_values()
         self.refresh_providers(reset_to_current=True)
         self.schedule_preview()
+        self._schedule_ui_event_drain()
 
         if self.smoke_ui:
             self.root.geometry("900x720+40+40")
@@ -402,6 +491,8 @@ class BatchSenderApp:
         self.request_timeout_var = tk.StringVar()
         self.max_wait_var = tk.StringVar()
         self.poll_interval_var = tk.StringVar()
+        self.success_keepalive_var = tk.BooleanVar()
+        self.success_keepalive_minutes_var = tk.StringVar()
         self.unique_cache_var = tk.BooleanVar()
         self.save_full_response_var = tk.BooleanVar()
         self.custom_body_var = tk.BooleanVar()
@@ -612,7 +703,7 @@ class BatchSenderApp:
 
         numeric = ttk.Frame(parent, style="Surface.TFrame")
         numeric.grid(row=2, column=0, sticky="ew")
-        for column in range(3):
+        for column in range(4):
             numeric.grid_columnconfigure(column, weight=1, uniform="numeric")
         self.request_count_spin = self._spin_field(
             numeric,
@@ -639,9 +730,31 @@ class BatchSenderApp:
             3600,
             increment=1,
         )
-        ttk.Label(parent, textvariable=self.limit_var, style="Limit.TLabel").grid(
-            row=3, column=0, sticky="w", pady=(8, 0)
+        self.success_keepalive_spin = self._spin_field(
+            numeric,
+            3,
+            "保持间隔（分）",
+            self.success_keepalive_minutes_var,
+            1,
+            1440,
+            increment=1,
         )
+        keepalive_line = ttk.Frame(parent, style="Surface.TFrame")
+        keepalive_line.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        keepalive_line.grid_columnconfigure(0, weight=1)
+        ttk.Label(keepalive_line, textvariable=self.limit_var, style="Limit.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.success_keepalive_check = self._checkbutton(
+            keepalive_line,
+            "成功后定时保持",
+            self.success_keepalive_var,
+            compact=True,
+            command=self._on_keepalive_changed,
+        )
+        self.success_keepalive_check.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        Tooltip(self.success_keepalive_check, "首次成功后发送 Windows 通知，并按间隔继续发送单个请求")
+        self._editable_ttk.extend([self.success_keepalive_spin, self.success_keepalive_check])
 
     def _build_advanced_settings(self, parent: ttk.Frame) -> None:
         parent.grid_columnconfigure(0, weight=1)
@@ -964,12 +1077,14 @@ class BatchSenderApp:
             self.request_timeout_var,
             self.max_wait_var,
             self.poll_interval_var,
+            self.success_keepalive_minutes_var,
             self.cli_concurrency_var,
         ):
             variable.trace_add("write", lambda *_args: self.schedule_preview())
         self.unique_cache_var.trace_add("write", lambda *_args: self.schedule_preview())
         self.save_full_response_var.trace_add("write", lambda *_args: self.schedule_preview())
         self.random_probe_var.trace_add("write", lambda *_args: self.schedule_preview())
+        self.success_keepalive_var.trace_add("write", lambda *_args: self.schedule_preview())
         self.root.bind("<Control-Return>", lambda _event: self.start_run())
         self.root.bind("<Escape>", lambda _event: self.stop_run())
         self.root.bind("<F5>", lambda _event: self.refresh_providers())
@@ -991,6 +1106,10 @@ class BatchSenderApp:
         self.request_timeout_var.set(self._number_text(config["request_timeout_seconds"]))
         self.max_wait_var.set(self._number_text(config["max_wait_seconds"]))
         self.poll_interval_var.set(self._number_text(config["poll_interval_seconds"]))
+        self.success_keepalive_var.set(bool(config["success_keepalive_enabled"]))
+        self.success_keepalive_minutes_var.set(
+            self._number_text(float(config["success_keepalive_interval_seconds"]) / 60)
+        )
         self.unique_cache_var.set(bool(config["unique_prompt_cache_key"]))
         self.save_full_response_var.set(bool(config["save_full_response"]))
         self.custom_body_var.set(bool(config["custom_body_enabled"]))
@@ -1012,6 +1131,13 @@ class BatchSenderApp:
     def _number_text(value: Any) -> str:
         number = float(value)
         return str(int(number)) if number.is_integer() else str(number)
+
+    @staticmethod
+    def _duration_text(seconds: float) -> str:
+        total = max(0, int(seconds + 0.999))
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
 
     def refresh_providers(self, reset_to_current: bool = True) -> None:
         if self.running:
@@ -1115,6 +1241,12 @@ class BatchSenderApp:
         self._apply_transport_state()
         self.schedule_preview()
 
+    def _on_keepalive_changed(self) -> None:
+        if self.running:
+            return
+        self._apply_transport_state()
+        self.schedule_preview()
+
     def _apply_transport_state(self) -> None:
         cli_mode = self.transport_mode_var.get() == TRANSPORT_CODEX_CLI
         editable = not self.running
@@ -1130,6 +1262,9 @@ class BatchSenderApp:
         ):
             widget.state(["!disabled"] if editable and not cli_mode else ["disabled"])
         self.cli_concurrency_spin.state(["!disabled"] if editable and cli_mode else ["disabled"])
+        self.success_keepalive_spin.state(
+            ["!disabled"] if editable and self.success_keepalive_var.get() else ["disabled"]
+        )
         if cli_mode:
             self.body_text.configure(state="disabled")
         elif editable and self.custom_body_var.get():
@@ -1206,6 +1341,16 @@ class BatchSenderApp:
 
     def collect_config(self, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         data = dict(self.base_config)
+        keepalive_enabled = self.success_keepalive_var.get()
+        raw_keepalive_minutes = self.success_keepalive_minutes_var.get()
+        try:
+            keepalive_interval_seconds = float(raw_keepalive_minutes) * 60
+        except (TypeError, ValueError) as exc:
+            if keepalive_enabled:
+                raise SenderError("成功后保持间隔必须是分钟数。") from exc
+            keepalive_interval_seconds = float(
+                self.base_config.get("success_keepalive_interval_seconds", 180)
+            )
         data.update(
             {
                 "transport_mode": self.transport_mode_var.get(),
@@ -1222,6 +1367,8 @@ class BatchSenderApp:
                 "request_timeout_seconds": self.request_timeout_var.get(),
                 "max_wait_seconds": self.max_wait_var.get(),
                 "poll_interval_seconds": self.poll_interval_var.get(),
+                "success_keepalive_enabled": keepalive_enabled,
+                "success_keepalive_interval_seconds": keepalive_interval_seconds,
                 "endpoint_style": ENDPOINT_LABELS.get(self.endpoint_style_var.get(), "auto"),
                 "unique_prompt_cache_key": self.unique_cache_var.get(),
                 "save_full_response": self.save_full_response_var.get(),
@@ -1280,26 +1427,35 @@ class BatchSenderApp:
         try:
             count = int(self.request_count_var.get())
             retries = int(self.retry_count_var.get())
+            keepalive_minutes = (
+                float(self.success_keepalive_minutes_var.get())
+                if self.success_keepalive_var.get()
+                else 0
+            )
             if retries < 0:
                 raise ValueError
             if self.transport_mode_var.get() == TRANSPORT_CODEX_CLI:
                 concurrency = int(self.cli_concurrency_var.get())
                 if retries == 0:
-                    self.limit_var.set(f"无限批次 · 直到成功或手动停止 · CLI 并发 {concurrency}")
+                    limit_text = f"无限批次 · 直到成功或手动停止 · CLI 并发 {concurrency}"
                 else:
                     cap = count * (1 + retries)
-                    self.limit_var.set(f"上限 {cap} 个任务 · CLI 并发 {concurrency}")
+                    limit_text = f"上限 {cap} 个任务 · CLI 并发 {concurrency}"
                 button_text = f"运行 {count} 个任务"
             else:
                 if retries == 0:
-                    self.limit_var.set("无限批次 · 直到成功或手动停止")
+                    limit_text = "无限批次 · 直到成功或手动停止"
                 else:
                     cap = count * (1 + retries)
-                    self.limit_var.set(f"上限 {cap} 个 POST")
+                    limit_text = f"上限 {cap} 个 POST"
                 button_text = f"发送 {count} 个"
+            if self.success_keepalive_var.get():
+                if keepalive_minutes <= 0:
+                    raise ValueError
+            self.limit_var.set(limit_text)
             self.start_button.configure(text=button_text) if hasattr(self, "start_button") else None
         except (TypeError, ValueError):
-            self.limit_var.set("请求次数或重试次数无效")
+            self.limit_var.set("请求次数、重试次数或保持间隔无效")
 
     def start_run(self) -> None:
         if self.running or self.blocked_by_unfinished or not self.can_start:
@@ -1320,10 +1476,18 @@ class BatchSenderApp:
             return
 
         self.running = True
-        self.stop_event.clear()
+        self.stop_event = threading.Event()
+        run_stop_event = self.stop_event
         self.latest_result = None
         self.last_run_config = config
         self.run_started_at = time.monotonic()
+        self.keepalive_next_run_at = 0.0
+        self.keepalive_started = False
+        self.keepalive_active = False
+        self.keepalive_request_active = False
+        self.success_notification_sent = False
+        self.run_generation += 1
+        generation = self.run_generation
         progress_maximum = (
             int(config["request_count"])
             if int(config["retry_count"]) == 0
@@ -1342,22 +1506,68 @@ class BatchSenderApp:
         self._set_editing_enabled(False)
         self.stop_button.state(["!disabled"])
         self._start_elapsed_clock()
-        logger = RunLogger(callback=self.append_log_threadsafe)
+        logger = RunLogger(
+            callback=lambda line: self.append_log_threadsafe(line, generation)
+        )
+        self.active_logger = logger
 
         def job() -> None:
             try:
                 outcome = run_batch(
                     config,
                     logger,
-                    stop_event=self.stop_event,
-                    on_winner=self.on_winner_threadsafe,
-                    on_progress=self.on_progress_threadsafe,
+                    stop_event=run_stop_event,
+                    on_winner=lambda result: self.on_winner_threadsafe(result, generation),
+                    on_progress=lambda event: self.on_progress_threadsafe(event, generation),
                     provider_loader=lambda _config: provider,
                 )
-                self.root.after(0, lambda: self.finish_run(outcome))
+                should_start_keepalive = _should_start_success_keepalive(
+                    outcome,
+                    config,
+                    stopped=run_stop_event.is_set(),
+                )
+                if should_start_keepalive:
+                    keepalive_entered = threading.Event()
+
+                    def report_keepalive_progress(event: ProgressEvent) -> None:
+                        if event.kind == "keepalive_wait":
+                            keepalive_entered.set()
+                        self.on_progress_threadsafe(event, generation)
+
+                    run_success_keepalive(
+                        provider,
+                        config,
+                        logger,
+                        run_stop_event,
+                        on_progress=report_keepalive_progress,
+                    )
+                    # A stop can race with the keepalive worker before its
+                    # first progress event reaches the UI. Queue a final
+                    # idempotent notification check so a real success is
+                    # never silent in that narrow window.
+                    self._post_to_ui(
+                        lambda: self._notify_success(
+                            keepalive_started=keepalive_entered.is_set(),
+                            generation=generation,
+                        ),
+                        generation,
+                    )
+                elif _should_notify_success_without_keepalive(
+                    outcome,
+                    config,
+                    stopped=run_stop_event.is_set(),
+                ):
+                    self._post_to_ui(
+                        lambda: self._notify_success(
+                            keepalive_started=False,
+                            generation=generation,
+                        ),
+                        generation,
+                    )
+                self._post_to_ui(lambda: self.finish_run(outcome), generation)
             except Exception as exc:
-                self.append_log_threadsafe(f"ERROR {type(exc).__name__}: {exc}")
-                self.root.after(0, lambda: self.finish_error(exc))
+                self.append_log_threadsafe(f"ERROR {type(exc).__name__}: {exc}", generation)
+                self._post_to_ui(lambda exc=exc: self.finish_error(exc), generation)
 
         self.running_thread = threading.Thread(target=job, name="ccswitch-runner", daemon=True)
         self.running_thread.start()
@@ -1366,20 +1576,93 @@ class BatchSenderApp:
         if not self.running or self.stop_event.is_set():
             return
         self.stop_event.set()
-        self.progress_text_var.set("正在停止，等待已启动任务结束")
+        self.progress_text_var.set(
+            "正在停止定时保持" if self.keepalive_active else "正在停止，等待已启动任务结束"
+        )
         self._set_status("stopping")
         self.stop_button.state(["disabled"])
 
-    def on_winner_threadsafe(self, result: AttemptResult) -> None:
-        self.root.after(0, lambda: self.show_winner(result))
+    def on_winner_threadsafe(self, result: AttemptResult, generation: int | None = None) -> None:
+        if generation is not None and generation != self.run_generation:
+            return
+        self._post_to_ui(lambda: self.show_winner(result), generation)
+        config = dict(self.last_run_config or {})
+        if not bool(config.get("success_keepalive_enabled")):
+            self._post_to_ui(
+                lambda: self._notify_success(
+                    keepalive_started=False,
+                    generation=generation,
+                ),
+                generation,
+            )
 
-    def on_progress_threadsafe(self, event: ProgressEvent) -> None:
-        self.root.after(0, lambda: self.apply_progress(event))
+    def _notify_success(
+        self,
+        *,
+        keepalive_started: bool,
+        generation: int | None = None,
+    ) -> None:
+        if (
+            self.success_notification_sent
+            or self.closing
+            or (generation is not None and generation != self.run_generation)
+        ):
+            return
+        self.success_notification_sent = True
+        config = dict(self.last_run_config or {})
+        logger = self.active_logger
 
-    def append_log_threadsafe(self, line: str) -> None:
-        self.root.after(0, lambda: self.append_log(line))
+        def notify() -> None:
+            if keepalive_started:
+                minutes = float(config.get("success_keepalive_interval_seconds", 180)) / 60
+                body = f"首次请求已成功，已进入每 {self._number_text(minutes)} 分钟定时保持。"
+            else:
+                body = "批量请求已获得成功响应。"
+            shown = show_windows_notification("CC Switch 批量请求成功", body)
+            if logger is not None:
+                logger.log(f"WINDOWS_NOTIFICATION shown={str(shown).lower()}")
+
+        threading.Thread(target=notify, name="ccswitch-notification", daemon=True).start()
+
+    def on_progress_threadsafe(self, event: ProgressEvent, generation: int | None = None) -> None:
+        self._post_to_ui(lambda: self.apply_progress(event), generation)
+
+    def append_log_threadsafe(self, line: str, generation: int | None = None) -> None:
+        self._post_to_ui(lambda: self.append_log(line), generation)
+
+    def _post_to_ui(self, callback: Callable[[], None], generation: int | None = None) -> None:
+        if self.closing or (generation is not None and generation != self.run_generation):
+            return
+        self.ui_event_queue.put((generation, callback))
+
+    def _schedule_ui_event_drain(self) -> None:
+        if self.closing or self.ui_event_after_id is not None:
+            return
+        try:
+            self.ui_event_after_id = self.root.after(25, self._drain_ui_events)
+        except (tk.TclError, RuntimeError):
+            self.ui_event_after_id = None
+
+    def _drain_ui_events(self) -> None:
+        self.ui_event_after_id = None
+        if self.closing:
+            return
+        try:
+            for _ in range(500):
+                try:
+                    generation, callback = self.ui_event_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if generation is not None and generation != self.run_generation:
+                    continue
+                callback()
+        finally:
+            self._schedule_ui_event_drain()
 
     def apply_progress(self, event: ProgressEvent) -> None:
+        if event.kind.startswith("keepalive_"):
+            self._apply_keepalive_progress(event)
+            return
         unlimited = bool(self.last_run_config and int(self.last_run_config.get("retry_count", 0)) == 0)
         if unlimited:
             if event.round_size > 0:
@@ -1407,7 +1690,7 @@ class BatchSenderApp:
                     "上游在途请求仍可能计费"
                 )
             else:
-                message = f"第 {event.round_no} 批 #{event.winner.index} 成功，已取消同批后续轮询"
+                message = f"第 {event.round_no} 批 #{event.winner.index} 成功，已取消同批请求并等待回收"
             self.progress_text_var.set(message)
             self._set_status("success")
         elif event.kind == "retry_wait":
@@ -1424,6 +1707,60 @@ class BatchSenderApp:
         elif event.kind == "done":
             self.progress_text_var.set("本次运行已完成")
 
+    def _apply_keepalive_progress(self, event: ProgressEvent) -> None:
+        if event.kind in {"keepalive_wait", "keepalive_start", "keepalive_result"}:
+            self.keepalive_started = True
+        self.metrics_var.set(
+            f"定时请求 {event.keepalive_sequence} · 成功 {event.keepalive_successes} · 失败 {event.keepalive_failures}"
+        )
+        if event.kind == "keepalive_wait":
+            self.keepalive_active = True
+            self.keepalive_request_active = False
+            self.keepalive_next_run_at = event.next_run_at
+            self._notify_success(keepalive_started=True, generation=self.run_generation)
+            interval = float((self.last_run_config or {}).get("success_keepalive_interval_seconds", 180))
+            self.progressbar.configure(maximum=max(1, interval), value=0)
+            self.progress_text_var.set(f"定时保持中 · 下次请求 {self._duration_text(interval)}")
+            self._set_status("keeping")
+        elif event.kind == "keepalive_start":
+            self.keepalive_active = True
+            self.keepalive_request_active = True
+            self.keepalive_next_run_at = 0.0
+            self.progress_text_var.set(f"正在发送第 {event.keepalive_sequence} 次定时请求")
+            self._set_status("keeping")
+        elif event.kind == "keepalive_result":
+            self.keepalive_request_active = False
+            result_text = "成功" if event.winner is not None else "失败"
+            self.progress_text_var.set(f"第 {event.keepalive_sequence} 次定时请求{result_text}")
+            self._set_status("keeping" if event.winner is not None else "warning")
+            if event.result is not None:
+                self._show_keepalive_result(event.keepalive_sequence, event.result)
+        elif event.kind == "keepalive_stopped":
+            self.keepalive_active = False
+            self.keepalive_request_active = False
+            self.keepalive_next_run_at = 0.0
+            self.progress_text_var.set("定时保持已停止")
+            self._set_status("success")
+
+    def _show_keepalive_result(self, sequence: int, result: AttemptResult) -> None:
+        source_label = (
+            "Codex CLI"
+            if self.last_run_config and self.last_run_config.get("transport_mode") == TRANSPORT_CODEX_CLI
+            else f"HTTP {result.status or '-'}"
+        )
+        state = "成功" if result.ok else "失败"
+        detail = result.text.strip() if result.ok else result.error.strip()
+        completed_at = result.completed_at or dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        self.result_title_var.set("最近一次定时结果")
+        self._set_readonly_text(
+            self.result_text,
+            f"第 {sequence} 次 · {state} · {source_label} · {result.latency_ms} ms\n"
+            f"完成时间：{completed_at}\n{detail or '没有响应内容'}",
+        )
+        self.latest_result = result
+        self.result_copy_button.state(["!disabled"])
+        self.result_export_button.state(["!disabled"])
+
     def show_winner(self, result: AttemptResult) -> None:
         self.latest_result = result
         text = result.text.strip() or "已收到成功响应"
@@ -1432,7 +1769,11 @@ class BatchSenderApp:
             if self.last_run_config and self.last_run_config.get("transport_mode") == TRANSPORT_CODEX_CLI
             else f"HTTP {result.status or '-'}"
         )
-        lines = [f"第 {result.round_no} 批 #{result.index} · {source_label} · {result.latency_ms} ms"]
+        completed_at = result.completed_at or dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        lines = [
+            f"第 {result.round_no} 批 #{result.index} · {source_label} · {result.latency_ms} ms",
+            f"成功时间：{completed_at}",
+        ]
         if result.request_prompt:
             lines.append(f"请求：{result.request_prompt}")
         lines.append(f"响应：{text}")
@@ -1448,14 +1789,22 @@ class BatchSenderApp:
         self._stop_elapsed_clock()
         if outcome.unfinished > 0:
             self.blocked_by_unfinished = True
-            self.progress_text_var.set(f"仍有 {outcome.unfinished} 个任务未结束；关闭应用可中断")
+            if outcome.winner is not None:
+                message = (
+                    "已有成功结果，但仍有 %s 个同批请求未结束；"
+                    "定时保持暂未启动，请关闭应用回收它们。"
+                    % outcome.unfinished
+                )
+            else:
+                message = f"仍有 {outcome.unfinished} 个任务未结束；关闭应用可中断"
+            self.progress_text_var.set(message)
             self._set_status("warning")
             self._set_editing_enabled(True)
             self.start_button.state(["disabled"])
             return
         self._set_editing_enabled(True)
         if outcome.winner is not None:
-            self.progress_text_var.set("本次运行已完成")
+            self.progress_text_var.set("定时保持已停止" if self.keepalive_started else "本次运行已完成")
             self._set_status("success")
         elif outcome.code == 130:
             self.progress_text_var.set("已停止")
@@ -1750,6 +2099,7 @@ class BatchSenderApp:
             "running": ("发送中", "#2A5B49", "#E0F5E9"),
             "success": ("已成功", "#1E6B47", "#E5F7EC"),
             "waiting": ("等待重试", "#70501F", "#FFF1D9"),
+            "keeping": ("定时保持", "#2A5B49", "#E0F5E9"),
             "stopping": ("停止中", "#70501F", "#FFF1D9"),
             "warning": ("需注意", "#70501F", "#FFF1D9"),
             "error": ("失败", "#6D2B27", "#FDECEA"),
@@ -1788,6 +2138,11 @@ class BatchSenderApp:
             if not self.running:
                 return
             self.elapsed_var.set(f"{time.monotonic() - self.run_started_at:.1f} s")
+            if self.keepalive_active and not self.keepalive_request_active and self.keepalive_next_run_at > 0:
+                remaining = max(0.0, self.keepalive_next_run_at - time.time())
+                interval = float((self.last_run_config or {}).get("success_keepalive_interval_seconds", 180))
+                self.progressbar.configure(maximum=max(1, interval), value=max(0, interval - remaining))
+                self.progress_text_var.set(f"定时保持中 · 下次请求 {self._duration_text(remaining)}")
             self.elapsed_after_id = self.root.after(250, tick)
 
         tick()
@@ -1858,7 +2213,14 @@ class BatchSenderApp:
                 parent=self.root,
             ):
                 return
+        self.closing = True
         self.stop_event.set()
+        if self.ui_event_after_id is not None:
+            try:
+                self.root.after_cancel(self.ui_event_after_id)
+            except tk.TclError:
+                pass
+            self.ui_event_after_id = None
         terminate_active_codex_processes()
         self.root.destroy()
 
