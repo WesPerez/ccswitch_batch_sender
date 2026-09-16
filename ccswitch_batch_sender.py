@@ -1798,7 +1798,6 @@ def build_body(
                 "content": [{"type": "input_text", "text": message}],
             }
         ],
-        "reasoning": {"effort": "minimal"},
         "store": False,
         "stream": False,
         "include": ["reasoning.encrypted_content"],
@@ -2134,7 +2133,6 @@ class _AbortableHTTPSHandler(urllib.request.HTTPSHandler):
             ),
             req,
             context=self._context,
-            check_hostname=self._check_hostname,
         )
 
 

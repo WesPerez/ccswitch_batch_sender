@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 import random
 import sqlite3
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -833,6 +834,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(body["model"], "gpt-test")
         self.assertEqual(body["input"][0]["content"][0]["text"], "probe")
         self.assertNotIn("instructions", body)
+        self.assertNotIn("reasoning", body)
         self.assertEqual(body["prompt_cache_key"], sender.PROMPT_CACHE_KEY_PLACEHOLDER)
         self.assertEqual(body["max_output_tokens"], 3)
 
@@ -845,12 +847,37 @@ class ProtocolTests(unittest.TestCase):
         config = sender.normalize_config(
             {
                 "custom_body_enabled": True,
-                "custom_body": {"model": "custom", "input": [{"role": "user", "content": "x"}]},
+                "custom_body": {
+                    "model": "custom",
+                    "input": [{"role": "user", "content": "x"}],
+                    "reasoning": {"effort": "high"},
+                },
             }
         )
         body = sender.build_body(self.provider, config)
+        self.assertEqual(body, config["custom_body"])
         body["model"] = "changed"
         self.assertEqual(config["custom_body"]["model"], "custom")
+
+    def test_https_handler_constructs_connection_with_certificate_verification(self) -> None:
+        abort_event = threading.Event()
+        registry = sender._RequestSocketRegistry()
+        handler = sender._AbortableHTTPSHandler(abort_event, registry)
+        request = sender.urllib.request.Request("https://example.invalid/")
+
+        def construct_connection(factory: Any, req: Any, **kwargs: Any) -> Any:
+            return factory(req.host, **kwargs)
+
+        with mock.patch.object(handler, "do_open", side_effect=construct_connection):
+            connection = handler.https_open(request)
+        try:
+            self.assertIsInstance(connection, sender._AbortableHTTPSConnection)
+            self.assertIs(connection._abort_event, abort_event)
+            self.assertIs(connection._socket_registry, registry)
+            self.assertTrue(connection._context.check_hostname)
+            self.assertEqual(connection._context.verify_mode, ssl.CERT_REQUIRED)
+        finally:
+            connection.close()
 
     def test_custom_body_replaces_exact_placeholders_per_request(self) -> None:
         template = {
